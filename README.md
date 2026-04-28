@@ -1,54 +1,62 @@
 # M5 Voice Stick
 
-Cross-platform prototype for an M5StickC Plus2 push-to-talk transcriber.
+A wearable voice-pendant prototype on the M5StickC Plus2.
 
-## Flow
+The Stick hangs portrait-up as a **necklace**, broadcasting a mood as live abstract art. Hold the side button to push-to-talk; the phone transcribes. The transcript can also nudge the mood — say something loving and the necklace blooms; say something stormy and it crackles.
 
-1. Hold Button A on the M5StickC Plus2.
-2. Speak into the Stick.
-3. The Stick streams 16 kHz, 16-bit mono PCM to the phone over BLE.
-4. The phone app wraps the PCM as a WAV file and calls OpenAI `audio/transcriptions`.
-5. The phone sends `TEXT:<transcript>` back over BLE.
-6. The Stick displays the transcript.
+## Two modes, one device
 
-## Stick Buttons
+- **Necklace** (default): the Stick shows one of 8 abstract moods. Pick from the phone, cycle on the device, or let the transcript suggest one.
+- **Push-to-talk**: hold Button A, speak, release. The phone uploads to OpenAI and sends the transcript back to the Stick. The transcript briefly takes over the screen, then the mood returns.
+
+## Moods
+
+| id | feel | art |
+| ------ | ------ | ------ |
+| `PULSE` | alive | concentric rings expanding outward |
+| `BLOOM` | in love | radiating petals beating |
+| `DRIFT` | calm | layered sine waves |
+| `STATIC` | anxious | TV noise + scanlines |
+| `STORM` | angry | lightning bolts flickering |
+| `ORBIT` | curious | dots circling a core |
+| `GRID` | focused | pulsing geometric grid |
+| `PRISM` | party | rotating triangles |
+
+While recording, the active mood reacts to your voice — louder peaks intensify the animation. Idle, it breathes on a slow sine.
+
+## Controls
 
 | Button | Action | Effect |
 | ------ | ------ | ------ |
 | **A** (front "M5") | hold | push-to-talk · capture while held |
-| **A** | double-tap | toggle hands-free lock · tap A again to stop |
-| **B** (top side) | tap | cycle view · LIVE → HISTORY → INFO |
-| **B** | tap (in HISTORY) | step through last 4 transcripts |
-| **B** | hold | dismiss current transcript / fault, return to LIVE |
-| **B** | double-tap | cycle screen brightness (4 levels) |
+| **A** | double-tap | hands-free lock · tap A again to stop |
+| **B** (top side) | tap | cycle mood (broadcasts to phone) |
+| **B** | double-tap | brightness (4 levels) |
+| **B** | hold | toggle device-info overlay |
 
-The Stick auto-returns to the LIVE view after 12 s of inactivity in HISTORY/INFO.
+Transcripts and faults overlay the mood for ~6 s, then the art returns.
 
-## Stick States
+## States
 
 ```
 Standby ──link──▶ Ready ──BtnA──▶ Recording ──release──▶ Uploading ──TEXT──▶ Transcript
    ▲                ▲                                                            │
-   └──disconnect────┴──────────────── BtnB hold ───────────────────────────────┘
+   └──disconnect────┴────────────── overlay timeout ───────────────────────────┘
 ```
-
-Faults from the phone (`ERR:<msg>`) are displayed on the Stick and dismissible with a long-press of Button B.
 
 ## Folders
 
-- `code/hardware code-stick/` - PlatformIO firmware for the M5StickC Plus2.
-- `code/mobile-app/` - Expo React Native app for iOS and Android.
+- `hardware-code-stick/` — PlatformIO firmware for the M5StickC Plus2.
+- `mobile-app/` — Expo React Native app for iOS and Android.
 
 ## OpenAI
 
-The mobile app uses:
+The phone calls:
 
-- Endpoint: `POST https://api.openai.com/v1/audio/transcriptions`
-- Model: `gpt-4o-transcribe`
-- File type sent: WAV
-- Romanization fallback: `gpt-4.1-mini` via `chat/completions` if the transcript contains non-Latin script
+- `POST https://api.openai.com/v1/audio/transcriptions` · model `gpt-4o-transcribe` · WAV
+- `POST https://api.openai.com/v1/chat/completions` · model `gpt-4.1-mini` (romanization fallback for non-Latin script)
 
-For a prototype, the app stores the API key locally with `expo-secure-store`. For anything shared with other users, replace the direct OpenAI call with your own backend so your API key is never shipped to phones.
+The API key lives in `mobile-app/secrets.js` (gitignored). For anything shared with other users, replace the direct OpenAI call with your own backend.
 
 ## BLE Protocol
 
@@ -59,16 +67,22 @@ Service UUID: `3e7a0001-e33b-4e2f-9a85-f03e1d33c001`
 
 Control messages are UTF-8 lines ending in `\n`:
 
-- Stick to phone: `START\n`
-- Stick to phone: `STOP\n`
-- Phone to Stick: `STATE:<text>\n`
-- Phone to Stick: `TEXT:<transcript>\n`
-- Phone to Stick: `ERR:<message>\n`
+| Direction | Message | Meaning |
+| ------ | ------ | ------ |
+| Stick → phone | `START\n` | recording started |
+| Stick → phone | `STOP\n` | recording stopped |
+| Stick → phone | `MOOD:<id>\n` | user cycled mood on device |
+| Phone → Stick | `STATE:<text>\n` | phone status (Ready/Recording/Transcribing) |
+| Phone → Stick | `TEXT:<transcript>\n` | transcript ready |
+| Phone → Stick | `MOOD:<id>\n` | set mood (from tile tap or transcript suggestion) |
+| Phone → Stick | `ERR:<message>\n` | upload error |
+
+Mood ids: `PULSE`, `BLOOM`, `DRIFT`, `STATIC`, `STORM`, `ORBIT`, `GRID`, `PRISM`.
 
 ## Flash The Stick
 
 ```sh
-cd "code/hardware code-stick"
+cd hardware-code-stick
 pio run -t upload
 pio device monitor
 ```
@@ -77,22 +91,14 @@ The firmware advertises as `M5VoiceStick`.
 
 ## Run The Phone App
 
-BLE native modules do not run inside Expo Go. Build a dev client or native app:
+BLE native modules don't run in Expo Go. Build a dev client:
 
 ```sh
-cd code/mobile-app
+cd mobile-app
+echo "export const OPENAI_API_KEY = 'sk-...';" > secrets.js
 npm install
 npm run prebuild
-npm run run:android
+npm run run:android   # or run:ios
 ```
 
-For iOS:
-
-```sh
-cd code/mobile-app
-npm install
-npm run prebuild
-npm run run:ios
-```
-
-Then enter your OpenAI API key, tap **Connect**, and hold Button A on the Stick while speaking.
+Tap **connect** in the app, then pick a mood or hold Button A on the Stick to talk.
