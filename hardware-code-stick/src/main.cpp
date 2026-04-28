@@ -2,13 +2,14 @@
 #include <M5StickCPlus2.h>
 #include <NimBLEDevice.h>
 #include <mbedtls/base64.h>
+#include <math.h>
 
 // ----------------------------------------------------------------------------
 // CONSTANTS
 // ----------------------------------------------------------------------------
 
 static constexpr const char* DEVICE_NAME = "M5VoiceStick";
-static constexpr const char* FIRMWARE_VERSION = "v0.2";
+static constexpr const char* FIRMWARE_VERSION = "v0.3";
 
 static const BLEUUID SERVICE_UUID("3e7a0001-e33b-4e2f-9a85-f03e1d33c001");
 static const BLEUUID AUDIO_UUID("3e7a0002-e33b-4e2f-9a85-f03e1d33c001");
@@ -19,8 +20,8 @@ static constexpr size_t SAMPLES_PER_CHUNK = 240;
 static constexpr size_t BLE_PAYLOAD_BYTES = 180;
 
 static constexpr size_t HISTORY_SIZE = 4;
-static constexpr uint32_t VIEW_AUTO_RETURN_MS = 12000;
-static constexpr uint32_t REDRAW_INTERVAL_MS = 120;
+static constexpr uint32_t OVERLAY_AUTO_DISMISS_MS = 6500;
+static constexpr uint32_t REDRAW_INTERVAL_MS = 70;
 
 static constexpr uint8_t BRIGHTNESS_LEVELS[] = {40, 90, 140, 200};
 static constexpr size_t BRIGHTNESS_COUNT = sizeof(BRIGHTNESS_LEVELS) / sizeof(BRIGHTNESS_LEVELS[0]);
@@ -30,10 +31,45 @@ static constexpr uint16_t COLOR_FG = 0xEF3B;
 static constexpr uint16_t COLOR_FG_DIM = 0xBDB6;
 static constexpr uint16_t COLOR_MUTED = 0x7C0F;
 static constexpr uint16_t COLOR_HAIRLINE = 0x39E7;
-static constexpr uint16_t COLOR_ACCENT = 0xD7E8;
 static constexpr uint16_t COLOR_DANGER = 0xFAA7;
 static constexpr uint16_t COLOR_OK = 0x37D5;
 static constexpr uint16_t COLOR_WARN = 0xFD20;
+
+// ----------------------------------------------------------------------------
+// MOOD CATALOG
+// ----------------------------------------------------------------------------
+
+enum class Mood : uint8_t {
+  Pulse,
+  Bloom,
+  Drift,
+  Static_,
+  Storm,
+  Orbit,
+  Grid,
+  Prism,
+  Count,
+};
+
+struct MoodSpec {
+  const char* name;
+  uint16_t primary;
+  uint16_t secondary;
+};
+
+// One palette per mood. Names are short and recognizable from across a room.
+static const MoodSpec MOODS[static_cast<size_t>(Mood::Count)] = {
+  { "PULSE",  0xFC06, 0x6981 },  // warm coral, expanding rings
+  { "BLOOM",  0xFA94, 0x802A },  // hot pink, beating petals
+  { "DRIFT",  0x551F, 0x1ACB },  // soft cyan, calm waves
+  { "STATIC", 0xFFFF, 0x4208 },  // white noise, anxious
+  { "STORM",  0xF986, 0x6800 },  // red, jagged lightning
+  { "ORBIT",  0xA21F, 0x310E },  // violet, dots circling
+  { "GRID",   0xB7E8, 0x4321 },  // lime, neutral focus
+  { "PRISM",  0xFE88, 0xC325 },  // gold, rotating shapes
+};
+
+static Mood currentMood = Mood::Grid;
 
 // ----------------------------------------------------------------------------
 // STATE
@@ -48,10 +84,11 @@ enum class AppState : uint8_t {
   Fault,
 };
 
-enum class View : uint8_t {
-  Live,
-  History,
+enum class Overlay : uint8_t {
+  None,
   Info,
+  Transcript,
+  Fault,
 };
 
 struct TranscriptEntry {
@@ -61,7 +98,8 @@ struct TranscriptEntry {
 };
 
 static AppState appState = AppState::Standby;
-static View currentView = View::Live;
+static Overlay overlay = Overlay::None;
+static uint32_t overlayUntilMs = 0;
 static String currentTranscript;
 static String currentFault;
 static String phoneStateLabel = "ready";
@@ -69,7 +107,6 @@ static String phoneStateLabel = "ready";
 static TranscriptEntry history[HISTORY_SIZE];
 static size_t historyHead = 0;
 static size_t historyCount = 0;
-static size_t historyCursor = 0;
 
 static bool phoneConnected = false;
 static bool streaming = false;
@@ -77,12 +114,13 @@ static bool recordingLock = false;
 
 static uint32_t recordingStartMs = 0;
 static uint32_t lastRecordingDurationMs = 0;
-static uint32_t lastViewChangeMs = 0;
 static uint32_t bootMs = 0;
 static uint32_t lastDrawMs = 0;
+static uint32_t frameCounter = 0;
 static uint8_t brightnessIndex = 2;
 
-static bool needsRedraw = true;
+static volatile int32_t audioPeakRaw = 0;   // updated by record loop
+static uint16_t audioLevel = 0;             // smoothed 0..255 for draw
 
 static int16_t audioBuffer[SAMPLES_PER_CHUNK];
 static NimBLECharacteristic* audioCharacteristic = nullptr;
@@ -93,6 +131,12 @@ static portMUX_TYPE controlMux = portMUX_INITIALIZER_UNLOCKED;
 static String pendingControlLine;
 static volatile bool hasPendingControlLine = false;
 
+// Off-screen sprite for the art region (smooth animation, no flicker).
+static M5Canvas artCanvas(&StickCP2.Display);
+static constexpr int16_t ART_SIZE = 135;
+static constexpr int16_t ART_X = 0;
+static constexpr int16_t ART_Y = 50;
+
 // ----------------------------------------------------------------------------
 // HELPERS
 // ----------------------------------------------------------------------------
@@ -100,60 +144,47 @@ static volatile bool hasPendingControlLine = false;
 static int16_t screenW() { return StickCP2.Display.width(); }
 static int16_t screenH() { return StickCP2.Display.height(); }
 
+static const MoodSpec& mood() { return MOODS[static_cast<size_t>(currentMood)]; }
+
 static const char* stateLabel(AppState s) {
   switch (s) {
-    case AppState::Standby:    return "STANDBY";
+    case AppState::Standby:    return "OFFLINE";
     case AppState::Ready:      return "READY";
-    case AppState::Recording:  return "CAPTURE";
+    case AppState::Recording:  return recordingLock ? "REC LOCK" : "REC";
     case AppState::Uploading:  return "UPLINK";
-    case AppState::Transcript: return "TRANSCRIPT";
+    case AppState::Transcript: return "OK";
     case AppState::Fault:      return "FAULT";
   }
   return "?";
 }
 
-static uint16_t stateAccent(AppState s) {
+static uint16_t stateColor(AppState s) {
   switch (s) {
-    case AppState::Standby:    return COLOR_MUTED;
-    case AppState::Ready:      return COLOR_ACCENT;
     case AppState::Recording:  return COLOR_DANGER;
-    case AppState::Uploading:  return COLOR_ACCENT;
-    case AppState::Transcript: return COLOR_ACCENT;
     case AppState::Fault:      return COLOR_DANGER;
-  }
-  return COLOR_ACCENT;
-}
-
-static const char* viewLabel(View v) {
-  switch (v) {
-    case View::Live:    return "LIVE";
-    case View::History: return "HIST";
-    case View::Info:    return "INFO";
-  }
-  return "?";
-}
-
-static void requestRedraw() { needsRedraw = true; }
-
-static void setView(View v) {
-  if (currentView == v) return;
-  currentView = v;
-  lastViewChangeMs = millis();
-  requestRedraw();
-}
-
-static void cycleView() {
-  switch (currentView) {
-    case View::Live:    setView(View::History); break;
-    case View::History: setView(View::Info);    break;
-    case View::Info:    setView(View::Live);    break;
+    case AppState::Uploading:  return COLOR_WARN;
+    case AppState::Transcript: return COLOR_OK;
+    case AppState::Ready:      return COLOR_FG_DIM;
+    default:                   return COLOR_MUTED;
   }
 }
+
+// RGB565 lerp toward black, used for fade trails.
+static uint16_t fadeColor(uint16_t c, uint8_t scale) {
+  uint16_t r = (c >> 11) & 0x1F;
+  uint16_t g = (c >> 5) & 0x3F;
+  uint16_t b = c & 0x1F;
+  r = (r * scale) >> 8;
+  g = (g * scale) >> 8;
+  b = (b * scale) >> 8;
+  return (r << 11) | (g << 5) | b;
+}
+
+static void requestRedraw() { /* no-op; redraw is throttled by frame timer */ }
 
 static void setBrightnessIndex(uint8_t i) {
   brightnessIndex = i % BRIGHTNESS_COUNT;
   StickCP2.Display.setBrightness(BRIGHTNESS_LEVELS[brightnessIndex]);
-  requestRedraw();
 }
 
 static void cycleBrightness() {
@@ -164,8 +195,44 @@ static void transition(AppState next) {
   if (appState == next) return;
   Serial.printf("[state] %s -> %s\n", stateLabel(appState), stateLabel(next));
   appState = next;
-  setView(View::Live);
-  requestRedraw();
+}
+
+static void showOverlay(Overlay o, uint32_t durationMs) {
+  overlay = o;
+  overlayUntilMs = millis() + durationMs;
+}
+
+static void clearOverlay() {
+  overlay = Overlay::None;
+  overlayUntilMs = 0;
+}
+
+static void notifyControl(const char* message);
+
+static void setMood(Mood m, bool broadcast) {
+  if (m == currentMood) return;
+  currentMood = m;
+  Serial.printf("[mood] -> %s\n", mood().name);
+  if (broadcast) {
+    char buf[32];
+    snprintf(buf, sizeof(buf), "MOOD:%s\n", mood().name);
+    notifyControl(buf);
+  }
+}
+
+static void cycleMood() {
+  uint8_t next = (static_cast<uint8_t>(currentMood) + 1) % static_cast<uint8_t>(Mood::Count);
+  setMood(static_cast<Mood>(next), true);
+}
+
+static bool moodFromName(const String& name, Mood& out) {
+  for (size_t i = 0; i < static_cast<size_t>(Mood::Count); ++i) {
+    if (name.equalsIgnoreCase(MOODS[i].name)) {
+      out = static_cast<Mood>(i);
+      return true;
+    }
+  }
+  return false;
 }
 
 static void pushHistory(const String& text) {
@@ -174,13 +241,6 @@ static void pushHistory(const String& text) {
   history[historyHead].used = true;
   historyHead = (historyHead + 1) % HISTORY_SIZE;
   if (historyCount < HISTORY_SIZE) historyCount++;
-  historyCursor = 0;
-}
-
-static const TranscriptEntry* historyAt(size_t cursor) {
-  if (cursor >= historyCount) return nullptr;
-  size_t idx = (historyHead + HISTORY_SIZE - 1 - cursor) % HISTORY_SIZE;
-  return &history[idx];
 }
 
 static String formatDuration(uint32_t ms) {
@@ -211,100 +271,355 @@ static String formatUptime(uint32_t ms) {
 }
 
 // ----------------------------------------------------------------------------
-// DRAW: shared chrome
+// AUDIO LEVEL — peak amplitude smoothed for visual reactivity
 // ----------------------------------------------------------------------------
 
-static void drawCornerCrosshair(int16_t x, int16_t y, int16_t dx, int16_t dy, uint16_t color) {
-  StickCP2.Display.drawLine(x, y, x + 6 * dx, y, color);
-  StickCP2.Display.drawLine(x, y, x, y + 6 * dy, color);
+static void updateAudioLevel() {
+  uint16_t target = 0;
+
+  if (streaming) {
+    int32_t peak = audioPeakRaw;
+    if (peak < 0) peak = 0;
+    int32_t scaled = peak / 96;             // ~32767/96 ≈ 340
+    if (scaled > 255) scaled = 255;
+    target = static_cast<uint16_t>(scaled);
+  } else {
+    // Idle breathing — soft sine so the pendant looks alive.
+    float t = frameCounter * 0.045f;
+    float breath = (sinf(t) + 1.0f) * 0.5f;
+    target = static_cast<uint16_t>(40.0f + breath * 80.0f);
+  }
+
+  // Asymmetric smoothing: rise fast, fall slow.
+  if (target > audioLevel) {
+    audioLevel = (audioLevel * 1 + target * 3) / 4;
+  } else {
+    audioLevel = (audioLevel * 6 + target * 1) / 7;
+  }
 }
 
-static void drawTopBar(uint16_t accentColor) {
-  drawCornerCrosshair(2, 2, 1, 1, accentColor);
-  drawCornerCrosshair(screenW() - 3, 2, -1, 1, accentColor);
-  StickCP2.Display.drawFastHLine(8, 16, screenW() - 16, COLOR_HAIRLINE);
+// ----------------------------------------------------------------------------
+// MOOD ART — each renders into the 135x135 art sprite
+// ----------------------------------------------------------------------------
 
+static void drawMoodPulse(uint32_t frame, uint16_t level) {
+  artCanvas.fillSprite(COLOR_BG);
+  const int16_t cx = ART_SIZE / 2;
+  const int16_t cy = ART_SIZE / 2;
+  uint16_t primary = mood().primary;
+  uint16_t secondary = mood().secondary;
+
+  // Expanding rings drift outward forever.
+  for (int i = 0; i < 4; ++i) {
+    int16_t r = ((frame / 2) + i * 16) % 64;
+    uint8_t scale = 240 - (r * 3);
+    uint16_t color = fadeColor(primary, scale);
+    artCanvas.drawCircle(cx, cy, r, color);
+    if (r > 2) artCanvas.drawCircle(cx, cy, r - 1, fadeColor(secondary, scale));
+  }
+
+  int16_t innerR = 7 + (level * 22) / 255;
+  artCanvas.fillCircle(cx, cy, innerR, primary);
+  artCanvas.fillCircle(cx, cy, innerR / 2, COLOR_FG);
+}
+
+static void drawMoodBloom(uint32_t frame, uint16_t level) {
+  artCanvas.fillSprite(COLOR_BG);
+  const int16_t cx = ART_SIZE / 2;
+  const int16_t cy = ART_SIZE / 2;
+  uint16_t primary = mood().primary;
+  uint16_t secondary = mood().secondary;
+
+  float beat = sinf(frame * 0.12f) * 0.5f + 0.5f;
+  float reach = 22.0f + beat * 18.0f + level * 0.08f;
+  float angleOffset = frame * 0.018f;
+
+  for (int i = 0; i < 6; ++i) {
+    float a = angleOffset + i * (PI / 3.0f);
+    int16_t px = cx + cosf(a) * reach;
+    int16_t py = cy + sinf(a) * reach;
+    artCanvas.fillCircle(px, py, 12, secondary);
+    artCanvas.fillCircle(px, py, 7, primary);
+  }
+
+  int16_t coreR = 6 + (level * 8) / 255;
+  artCanvas.fillCircle(cx, cy, coreR + 4, secondary);
+  artCanvas.fillCircle(cx, cy, coreR, primary);
+  artCanvas.fillCircle(cx, cy, coreR / 2, COLOR_FG);
+}
+
+static void drawMoodDrift(uint32_t frame, uint16_t level) {
+  artCanvas.fillSprite(COLOR_BG);
+  uint16_t primary = mood().primary;
+  uint16_t secondary = mood().secondary;
+  float amp = 6.0f + level * 0.05f;
+  float phase = frame * 0.08f;
+
+  for (int wave = 0; wave < 3; ++wave) {
+    int baseY = 30 + wave * 38;
+    uint16_t color = wave == 1 ? primary : secondary;
+    int16_t prevY = baseY;
+    for (int x = 0; x < ART_SIZE; ++x) {
+      float t = (x * 0.09f) + phase + wave * 1.7f;
+      int16_t y = baseY + sinf(t) * amp + cosf(t * 0.5f) * (amp * 0.4f);
+      artCanvas.drawLine(x - 1, prevY, x, y, color);
+      if (wave == 1) artCanvas.drawPixel(x, y + 1, fadeColor(color, 90));
+      prevY = y;
+    }
+  }
+}
+
+static void drawMoodStatic(uint32_t frame, uint16_t level) {
+  artCanvas.fillSprite(COLOR_BG);
+  uint16_t primary = mood().primary;
+  uint16_t secondary = mood().secondary;
+  uint32_t seed = frame * 2654435761u;
+
+  // Pseudo-random noise — densest near top.
+  int density = 80 + (level / 2);
+  for (int i = 0; i < density; ++i) {
+    seed = seed * 1103515245u + 12345u;
+    int16_t x = seed % ART_SIZE;
+    seed = seed * 1103515245u + 12345u;
+    int16_t y = seed % ART_SIZE;
+    seed = seed * 1103515245u + 12345u;
+    uint16_t color = (seed & 7) == 0 ? primary : secondary;
+    artCanvas.drawPixel(x, y, color);
+  }
+
+  // Scanlines that drift downward.
+  for (int row = 0; row < 4; ++row) {
+    int16_t y = ((frame * 2) + row * 36) % ART_SIZE;
+    artCanvas.drawFastHLine(0, y, ART_SIZE, fadeColor(primary, 110));
+  }
+
+  // Center hairline cross to anchor the chaos.
+  artCanvas.drawFastHLine(ART_SIZE / 2 - 12, ART_SIZE / 2, 24, fadeColor(primary, 200));
+  artCanvas.drawFastVLine(ART_SIZE / 2, ART_SIZE / 2 - 12, 24, fadeColor(primary, 200));
+}
+
+static void drawMoodStorm(uint32_t frame, uint16_t level) {
+  artCanvas.fillSprite(COLOR_BG);
+  uint16_t primary = mood().primary;
+  uint16_t secondary = mood().secondary;
+
+  // Lightning bolts — three jagged paths refreshed in sequence.
+  uint32_t seed = (frame / 3) * 2654435761u;
+  int boltCount = 2 + (level / 80);
+  for (int b = 0; b < boltCount; ++b) {
+    seed = seed * 1664525u + 1013904223u;
+    int16_t x = (seed % (ART_SIZE - 30)) + 15;
+    int16_t y = 4;
+    uint16_t color = (b == 0) ? primary : fadeColor(primary, 160);
+    while (y < ART_SIZE - 4) {
+      seed = seed * 1664525u + 1013904223u;
+      int16_t dx = ((seed >> 4) & 0xF) - 7;
+      int16_t dy = 6 + ((seed >> 8) & 0x7);
+      int16_t nx = x + dx;
+      int16_t ny = y + dy;
+      artCanvas.drawLine(x, y, nx, ny, color);
+      if (b == 0) artCanvas.drawLine(x + 1, y, nx + 1, ny, fadeColor(secondary, 180));
+      x = nx;
+      y = ny;
+    }
+  }
+
+  // Top "cloud" sweeping flicker.
+  if ((frame / 4) & 1) {
+    artCanvas.fillRect(0, 0, ART_SIZE, 6, fadeColor(secondary, 80));
+  }
+}
+
+static void drawMoodOrbit(uint32_t frame, uint16_t level) {
+  artCanvas.fillSprite(COLOR_BG);
+  const int16_t cx = ART_SIZE / 2;
+  const int16_t cy = ART_SIZE / 2;
+  uint16_t primary = mood().primary;
+  uint16_t secondary = mood().secondary;
+
+  // Three concentric orbital paths with different speeds.
+  for (int ring = 0; ring < 3; ++ring) {
+    int16_t radius = 18 + ring * 18;
+    artCanvas.drawCircle(cx, cy, radius, fadeColor(secondary, 110));
+    int dotCount = 1 + ring;
+    float speed = 0.025f + ring * 0.012f;
+    if (ring & 1) speed = -speed;
+    for (int i = 0; i < dotCount; ++i) {
+      float a = frame * speed + i * (2.0f * PI / dotCount);
+      int16_t px = cx + cosf(a) * radius;
+      int16_t py = cy + sinf(a) * radius;
+      uint16_t color = (ring == 1) ? primary : secondary;
+      artCanvas.fillCircle(px, py, 4 + ring, fadeColor(color, 200));
+      artCanvas.fillCircle(px, py, 2 + ring, primary);
+    }
+  }
+
+  int16_t coreR = 4 + (level * 5) / 255;
+  artCanvas.fillCircle(cx, cy, coreR, primary);
+}
+
+static void drawMoodGrid(uint32_t frame, uint16_t level) {
+  artCanvas.fillSprite(COLOR_BG);
+  uint16_t primary = mood().primary;
+  uint16_t secondary = mood().secondary;
+  const int16_t cell = 15;
+  const int16_t cols = ART_SIZE / cell;
+  const int16_t rows = ART_SIZE / cell;
+  const int16_t offsetX = (ART_SIZE - cols * cell) / 2;
+  const int16_t offsetY = (ART_SIZE - rows * cell) / 2;
+
+  for (int r = 0; r < rows; ++r) {
+    for (int c = 0; c < cols; ++c) {
+      float dx = c - cols / 2.0f + 0.5f;
+      float dy = r - rows / 2.0f + 0.5f;
+      float dist = sqrtf(dx * dx + dy * dy);
+      float wave = sinf(dist * 0.9f - frame * 0.13f);
+      uint8_t intensity = static_cast<uint8_t>(constrain(80 + (wave + 1.0f) * 80, 0, 255));
+      intensity = (intensity * (180 + level / 4)) / 255;
+      uint16_t color = (((r + c) & 1) == 0) ? primary : secondary;
+      int16_t x = offsetX + c * cell;
+      int16_t y = offsetY + r * cell;
+      int16_t s = 3 + (intensity / 32);
+      artCanvas.fillRect(x + (cell - s) / 2, y + (cell - s) / 2, s, s, fadeColor(color, intensity));
+    }
+  }
+}
+
+static void drawMoodPrism(uint32_t frame, uint16_t level) {
+  artCanvas.fillSprite(COLOR_BG);
+  const int16_t cx = ART_SIZE / 2;
+  const int16_t cy = ART_SIZE / 2;
+  uint16_t primary = mood().primary;
+  uint16_t secondary = mood().secondary;
+
+  float spin = frame * 0.04f;
+  int16_t reach = 38 + (level * 12) / 255;
+
+  // Three triangles, staggered rotation, alternating colors.
+  for (int t = 0; t < 3; ++t) {
+    float a = spin + t * (2.0f * PI / 3.0f);
+    int16_t x1 = cx + cosf(a) * reach;
+    int16_t y1 = cy + sinf(a) * reach;
+    int16_t x2 = cx + cosf(a + 2.094f) * reach;
+    int16_t y2 = cy + sinf(a + 2.094f) * reach;
+    int16_t x3 = cx + cosf(a + 4.188f) * reach;
+    int16_t y3 = cy + sinf(a + 4.188f) * reach;
+    uint16_t color = (t == 0) ? primary : (t == 1) ? secondary : 0xC744;
+    artCanvas.drawTriangle(x1, y1, x2, y2, x3, y3, color);
+  }
+
+  // Inner counter-rotating polygon.
+  float spin2 = -spin * 1.3f;
+  int16_t reach2 = 16 + (level * 6) / 255;
+  for (int i = 0; i < 6; ++i) {
+    float a1 = spin2 + i * (PI / 3.0f);
+    float a2 = spin2 + (i + 1) * (PI / 3.0f);
+    artCanvas.drawLine(
+      cx + cosf(a1) * reach2, cy + sinf(a1) * reach2,
+      cx + cosf(a2) * reach2, cy + sinf(a2) * reach2,
+      primary);
+  }
+
+  artCanvas.fillCircle(cx, cy, 3, COLOR_FG);
+}
+
+using MoodDrawFn = void (*)(uint32_t, uint16_t);
+static const MoodDrawFn MOOD_DRAW[static_cast<size_t>(Mood::Count)] = {
+  drawMoodPulse,
+  drawMoodBloom,
+  drawMoodDrift,
+  drawMoodStatic,
+  drawMoodStorm,
+  drawMoodOrbit,
+  drawMoodGrid,
+  drawMoodPrism,
+};
+
+// ----------------------------------------------------------------------------
+// CHROME — top status row, mood label, audio meter, bottom state line
+// ----------------------------------------------------------------------------
+
+static void drawTopChrome() {
+  // Tiny mark + link strength bars, fits a 135-wide screen.
   StickCP2.Display.setTextDatum(top_left);
   StickCP2.Display.setFont(&fonts::Font0);
   StickCP2.Display.setTextSize(1);
+  StickCP2.Display.setTextColor(mood().primary, COLOR_BG);
+  StickCP2.Display.drawString("M5VS", 6, 4);
 
-  StickCP2.Display.setTextColor(accentColor, COLOR_BG);
-  StickCP2.Display.drawString("M5VS", 8, 4);
-
-  StickCP2.Display.setTextColor(COLOR_MUTED, COLOR_BG);
-  StickCP2.Display.drawString("NODE 01", 36, 4);
-
-  StickCP2.Display.setTextDatum(top_right);
-  StickCP2.Display.setTextColor(accentColor, COLOR_BG);
-  StickCP2.Display.drawString(viewLabel(currentView), screenW() - 38, 4);
-
-  const int16_t barsX = screenW() - 30;
-  const int16_t bandY = 11;
-  const uint16_t onColor = phoneConnected ? COLOR_ACCENT : COLOR_HAIRLINE;
-  int activeBars = phoneConnected ? 5 : streaming ? 2 : 1;
-  for (int i = 0; i < 5; ++i) {
+  // Connection bars on the right.
+  const int16_t barsX = screenW() - 26;
+  const int16_t bandY = 12;
+  const uint16_t onColor = phoneConnected ? mood().primary : COLOR_HAIRLINE;
+  int activeBars = phoneConnected ? 4 : streaming ? 2 : 1;
+  for (int i = 0; i < 4; ++i) {
     int16_t height = 2 + i * 2;
-    int16_t x = barsX + i * 4;
+    int16_t x = barsX + i * 5;
     int16_t y = bandY - height;
     StickCP2.Display.fillRect(x, y, 3, height, i < activeBars ? onColor : COLOR_HAIRLINE);
   }
+
+  StickCP2.Display.drawFastHLine(6, 18, screenW() - 12, COLOR_HAIRLINE);
+
+  // Mood name in display font.
+  StickCP2.Display.setFont(&fonts::FreeMonoBold12pt7b);
+  StickCP2.Display.setTextColor(mood().primary, COLOR_BG);
+  StickCP2.Display.drawString(mood().name, 6, 26);
 }
 
-static void drawBottomBar(const char* leftLabel, uint16_t leftColor, const char* rightLabel) {
-  drawCornerCrosshair(2, screenH() - 3, 1, -1, COLOR_HAIRLINE);
-  drawCornerCrosshair(screenW() - 3, screenH() - 3, -1, -1, COLOR_HAIRLINE);
-  StickCP2.Display.drawFastHLine(8, screenH() - 17, screenW() - 16, COLOR_HAIRLINE);
+static void drawBottomChrome() {
+  // Audio level bar — only when no overlay is taking the lower region.
+  if (overlay == Overlay::None) {
+    const int16_t meterY = ART_Y + ART_SIZE + 4;
+    const int16_t meterW = screenW() - 12;
+    const int16_t meterH = 4;
+    StickCP2.Display.fillRect(6, meterY, meterW, meterH, COLOR_HAIRLINE);
+    int16_t fill = (meterW * audioLevel) / 255;
+    uint16_t meterColor = streaming ? COLOR_DANGER : mood().primary;
+    if (fill > 0) StickCP2.Display.fillRect(6, meterY, fill, meterH, meterColor);
+  }
 
-  StickCP2.Display.setTextDatum(top_left);
+  // Bottom state line.
   StickCP2.Display.setFont(&fonts::Font0);
   StickCP2.Display.setTextSize(1);
-  StickCP2.Display.setTextColor(leftColor, COLOR_BG);
-  StickCP2.Display.drawString(leftLabel, 8, screenH() - 12);
 
-  if (rightLabel) {
-    StickCP2.Display.setTextDatum(top_right);
-    StickCP2.Display.setTextColor(COLOR_MUTED, COLOR_BG);
-    StickCP2.Display.drawString(rightLabel, screenW() - 8, screenH() - 12);
-  }
+  StickCP2.Display.setTextDatum(top_left);
+  StickCP2.Display.setTextColor(stateColor(appState), COLOR_BG);
+  StickCP2.Display.drawString(stateLabel(appState), 6, screenH() - 12);
+
+  StickCP2.Display.setTextDatum(top_right);
+  StickCP2.Display.setTextColor(COLOR_MUTED, COLOR_BG);
+  char idx[16];
+  snprintf(idx, sizeof(idx), "%u/%u",
+           static_cast<unsigned>(static_cast<uint8_t>(currentMood) + 1),
+           static_cast<unsigned>(Mood::Count));
+  StickCP2.Display.drawString(idx, screenW() - 6, screenH() - 12);
 }
 
-static void drawStateLine(uint16_t color) {
-  const char* leftLabel = nullptr;
-  switch (appState) {
-    case AppState::Standby:    leftLabel = "OFFLINE"; break;
-    case AppState::Ready:      leftLabel = "STBY";    break;
-    case AppState::Recording:  leftLabel = recordingLock ? "REC LOCK" : "REC"; break;
-    case AppState::Uploading:  leftLabel = "UPLINK";  break;
-    case AppState::Transcript: leftLabel = "OK";      break;
-    case AppState::Fault:      leftLabel = "ERR";     break;
+static void drawArtRegion() {
+  MoodDrawFn fn = MOOD_DRAW[static_cast<size_t>(currentMood)];
+  fn(frameCounter, audioLevel);
+
+  // Recording indicator overlaid on the art top-right.
+  if (streaming) {
+    bool blink = (frameCounter / 4) & 1;
+    if (blink) artCanvas.fillCircle(ART_SIZE - 10, 10, 4, COLOR_DANGER);
+    artCanvas.drawCircle(ART_SIZE - 10, 10, 4, COLOR_DANGER);
+
+    // Recording timer, top-left of art.
+    artCanvas.setTextDatum(top_left);
+    artCanvas.setFont(&fonts::Font0);
+    artCanvas.setTextColor(COLOR_FG, COLOR_BG);
+    String dur = formatDuration(millis() - recordingStartMs);
+    artCanvas.drawString(dur, 6, 6);
   }
-  char right[32];
-  snprintf(right, sizeof(right), "BRT %u/%u",
-           static_cast<unsigned>(brightnessIndex + 1),
-           static_cast<unsigned>(BRIGHTNESS_COUNT));
-  drawBottomBar(leftLabel, color, right);
+
+  artCanvas.pushSprite(ART_X, ART_Y);
 }
 
 // ----------------------------------------------------------------------------
-// DRAW: per-view
+// OVERLAYS — transcript, fault, info take over the art area
 // ----------------------------------------------------------------------------
-
-static void drawCenteredHeadline(const String& title, const String& subtitle, uint16_t accent) {
-  StickCP2.Display.setTextDatum(middle_center);
-  StickCP2.Display.setFont(&fonts::FreeMonoBold12pt7b);
-  StickCP2.Display.setTextSize(1);
-  StickCP2.Display.setTextColor(accent, COLOR_BG);
-
-  String upper = title;
-  upper.toUpperCase();
-  StickCP2.Display.drawString(upper, screenW() / 2, screenH() / 2 - 14);
-
-  StickCP2.Display.drawFastHLine(screenW() / 2 - 14, screenH() / 2 + 4, 28, accent);
-
-  StickCP2.Display.setFont(&fonts::Font2);
-  StickCP2.Display.setTextColor(COLOR_FG_DIM, COLOR_BG);
-  StickCP2.Display.drawString(subtitle, screenW() / 2, screenH() / 2 + 22);
-}
 
 static void drawWrappedBody(const String& text,
                             int16_t startY,
@@ -352,136 +667,63 @@ static void drawWrappedBody(const String& text,
   }
 }
 
-static void drawRecordingScreen() {
-  StickCP2.Display.fillScreen(COLOR_BG);
-  uint16_t accent = stateAccent(appState);
-  drawTopBar(accent);
-
-  StickCP2.Display.setTextDatum(top_left);
-  StickCP2.Display.setFont(&fonts::FreeMonoBold12pt7b);
-  StickCP2.Display.setTextColor(COLOR_DANGER, COLOR_BG);
-  StickCP2.Display.drawString("CAPTURE", 10, 26);
-
-  StickCP2.Display.setFont(&fonts::Font0);
-  StickCP2.Display.setTextColor(recordingLock ? COLOR_ACCENT : COLOR_MUTED, COLOR_BG);
-  StickCP2.Display.drawString(recordingLock ? "LOCK · TAP A TO STOP" : "HOLD A TO TALK", 10, 50);
-
-  uint32_t elapsed = millis() - recordingStartMs;
-  String dur = formatDuration(elapsed);
-  StickCP2.Display.setTextDatum(top_right);
-  StickCP2.Display.setFont(&fonts::FreeMonoBold9pt7b);
-  StickCP2.Display.setTextColor(COLOR_FG, COLOR_BG);
-  StickCP2.Display.drawString(dur, screenW() - 10, 50);
-
-  // Level meter (pseudo from tick to feel alive)
-  const int16_t meterX = 10;
-  const int16_t meterY = screenH() - 38;
-  const int16_t meterW = screenW() - 20;
-  const int meterCells = 14;
-  const int16_t cellW = meterW / meterCells - 1;
-  uint32_t phase = (elapsed / 60) % meterCells;
-  for (int i = 0; i < meterCells; ++i) {
-    int distance = abs(static_cast<int>(phase) - i);
-    bool active = distance <= 2;
-    uint16_t color = active ? (i > meterCells - 4 ? COLOR_DANGER : COLOR_ACCENT) : COLOR_HAIRLINE;
-    StickCP2.Display.fillRect(meterX + i * (cellW + 1), meterY, cellW, 8, color);
-  }
-
-  drawStateLine(accent);
-}
-
-static void drawTranscriptScreen() {
-  StickCP2.Display.fillScreen(COLOR_BG);
-  drawTopBar(COLOR_ACCENT);
+static void drawTranscriptOverlay() {
+  StickCP2.Display.fillRect(0, ART_Y - 4, screenW(), screenH() - ART_Y - 18, COLOR_BG);
 
   StickCP2.Display.setTextDatum(top_left);
   StickCP2.Display.setFont(&fonts::Font0);
-  StickCP2.Display.setTextColor(COLOR_ACCENT, COLOR_BG);
-  StickCP2.Display.drawString("TRANSCRIPT", 8, 22);
+  StickCP2.Display.setTextColor(COLOR_OK, COLOR_BG);
+  StickCP2.Display.drawString("HEARD YOU", 6, ART_Y);
 
   StickCP2.Display.setTextDatum(top_right);
   StickCP2.Display.setTextColor(COLOR_MUTED, COLOR_BG);
   String meta = String(currentTranscript.length()) + "C";
   if (lastRecordingDurationMs > 0) {
-    meta += " / " + formatDuration(lastRecordingDurationMs);
+    meta += " " + formatDuration(lastRecordingDurationMs);
   }
-  StickCP2.Display.drawString(meta.c_str(), screenW() - 8, 22);
+  StickCP2.Display.drawString(meta.c_str(), screenW() - 6, ART_Y);
 
-  StickCP2.Display.drawFastHLine(8, 34, screenW() - 16, COLOR_HAIRLINE);
+  StickCP2.Display.drawFastHLine(6, ART_Y + 12, screenW() - 12, COLOR_HAIRLINE);
 
-  drawWrappedBody(currentTranscript, 40, screenH() - 22, 10, 16, COLOR_FG);
-  drawStateLine(COLOR_ACCENT);
+  drawWrappedBody(currentTranscript, ART_Y + 18, screenH() - 18, 6, 14, COLOR_FG);
 }
 
-static void drawHistoryScreen() {
-  StickCP2.Display.fillScreen(COLOR_BG);
-  drawTopBar(COLOR_ACCENT);
+static void drawFaultOverlay() {
+  StickCP2.Display.fillRect(0, ART_Y - 4, screenW(), screenH() - ART_Y - 18, COLOR_BG);
 
   StickCP2.Display.setTextDatum(top_left);
   StickCP2.Display.setFont(&fonts::Font0);
-  StickCP2.Display.setTextColor(COLOR_ACCENT, COLOR_BG);
-  StickCP2.Display.drawString("HISTORY", 8, 22);
+  StickCP2.Display.setTextColor(COLOR_DANGER, COLOR_BG);
+  StickCP2.Display.drawString("FAULT", 6, ART_Y);
+
+  StickCP2.Display.drawFastHLine(6, ART_Y + 12, screenW() - 12, COLOR_HAIRLINE);
+
+  drawWrappedBody(currentFault.length() ? currentFault : "see phone",
+                  ART_Y + 18, screenH() - 18, 6, 14, COLOR_DANGER);
+}
+
+static void drawInfoOverlay() {
+  StickCP2.Display.fillRect(0, ART_Y - 4, screenW(), screenH() - ART_Y - 18, COLOR_BG);
+
+  StickCP2.Display.setTextDatum(top_left);
+  StickCP2.Display.setFont(&fonts::Font0);
+  StickCP2.Display.setTextColor(mood().primary, COLOR_BG);
+  StickCP2.Display.drawString("DEVICE", 6, ART_Y);
 
   StickCP2.Display.setTextDatum(top_right);
   StickCP2.Display.setTextColor(COLOR_MUTED, COLOR_BG);
-  if (historyCount == 0) {
-    StickCP2.Display.drawString("0 / 0", screenW() - 8, 22);
-  } else {
-    char buf[16];
-    snprintf(buf, sizeof(buf), "%u / %u",
-             static_cast<unsigned>(historyCursor + 1),
-             static_cast<unsigned>(historyCount));
-    StickCP2.Display.drawString(buf, screenW() - 8, 22);
-  }
+  StickCP2.Display.drawString(FIRMWARE_VERSION, screenW() - 6, ART_Y);
 
-  StickCP2.Display.drawFastHLine(8, 34, screenW() - 16, COLOR_HAIRLINE);
+  StickCP2.Display.drawFastHLine(6, ART_Y + 12, screenW() - 12, COLOR_HAIRLINE);
 
-  if (historyCount == 0) {
-    StickCP2.Display.setTextDatum(middle_center);
-    StickCP2.Display.setFont(&fonts::Font2);
-    StickCP2.Display.setTextColor(COLOR_MUTED, COLOR_BG);
-    StickCP2.Display.drawString("no transmissions yet", screenW() / 2, screenH() / 2);
-  } else {
-    const TranscriptEntry* entry = historyAt(historyCursor);
-    if (entry) {
-      uint32_t age = (millis() - entry->arrivedAtMs) / 1000;
-      char ageBuf[24];
-      snprintf(ageBuf, sizeof(ageBuf), "%lus ago", static_cast<unsigned long>(age));
-
-      StickCP2.Display.setTextDatum(top_left);
-      StickCP2.Display.setFont(&fonts::Font0);
-      StickCP2.Display.setTextColor(COLOR_MUTED, COLOR_BG);
-      StickCP2.Display.drawString(ageBuf, 10, 38);
-
-      drawWrappedBody(entry->text, 50, screenH() - 22, 10, 16, COLOR_FG);
-    }
-  }
-
-  drawBottomBar("BTN B", COLOR_ACCENT, "TAP=NEXT");
-}
-
-static void drawInfoScreen() {
-  StickCP2.Display.fillScreen(COLOR_BG);
-  drawTopBar(COLOR_ACCENT);
-
-  StickCP2.Display.setTextDatum(top_left);
-  StickCP2.Display.setFont(&fonts::Font0);
-  StickCP2.Display.setTextColor(COLOR_ACCENT, COLOR_BG);
-  StickCP2.Display.drawString("DEVICE INFO", 8, 22);
-
-  StickCP2.Display.drawFastHLine(8, 34, screenW() - 16, COLOR_HAIRLINE);
-
-  int16_t y = 40;
-  const int16_t labelX = 10;
-  const int16_t valueX = 90;
-
-  auto drawRow = [&](const char* label, const String& value, uint16_t valueColor = COLOR_FG) {
+  int16_t y = ART_Y + 18;
+  auto row = [&](const char* label, const String& value, uint16_t valueColor) {
     StickCP2.Display.setTextDatum(top_left);
     StickCP2.Display.setFont(&fonts::Font0);
     StickCP2.Display.setTextColor(COLOR_MUTED, COLOR_BG);
-    StickCP2.Display.drawString(label, labelX, y);
+    StickCP2.Display.drawString(label, 6, y);
     StickCP2.Display.setTextColor(valueColor, COLOR_BG);
-    StickCP2.Display.drawString(value, valueX, y);
+    StickCP2.Display.drawString(value, 56, y);
     y += 12;
   };
 
@@ -491,52 +733,34 @@ static void drawInfoScreen() {
   uint16_t batteryColor = batteryLevel > 30 ? COLOR_OK : batteryLevel > 15 ? COLOR_WARN : COLOR_DANGER;
   bool charging = StickCP2.Power.isCharging();
 
-  drawRow("BATT", String(batteryLevel) + "%" + (charging ? " CHG" : ""), batteryColor);
-  drawRow("LINK", phoneConnected ? "CONNECTED" : "ADVERTISING",
-          phoneConnected ? COLOR_OK : COLOR_MUTED);
-  drawRow("UP",   formatUptime(millis() - bootMs));
-  drawRow("BRT",  String(BRIGHTNESS_LEVELS[brightnessIndex]) + " / 255");
-  drawRow("HIST", String(historyCount) + " / " + String(HISTORY_SIZE));
-
-  drawBottomBar("B·BRT", COLOR_ACCENT, FIRMWARE_VERSION);
+  row("BATT", String(batteryLevel) + "%" + (charging ? " CHG" : ""), batteryColor);
+  row("LINK", phoneConnected ? "ONLINE" : "ADV",
+      phoneConnected ? COLOR_OK : COLOR_MUTED);
+  row("UP",   formatUptime(millis() - bootMs), COLOR_FG);
+  row("BRT",  String(brightnessIndex + 1) + "/" + String(BRIGHTNESS_COUNT), COLOR_FG);
+  row("HIST", String(historyCount) + "/" + String(HISTORY_SIZE), COLOR_FG);
+  row("MOOD", String(mood().name), mood().primary);
 }
 
-static void drawLiveScreen() {
-  switch (appState) {
-    case AppState::Recording:
-      drawRecordingScreen();
-      return;
-    case AppState::Transcript:
-      drawTranscriptScreen();
-      return;
-    default:
-      break;
-  }
-
-  StickCP2.Display.fillScreen(COLOR_BG);
-  uint16_t accent = stateAccent(appState);
-  drawTopBar(accent);
-
-  String subtitle;
-  switch (appState) {
-    case AppState::Standby:   subtitle = "awaiting host"; break;
-    case AppState::Ready:     subtitle = "hold btn a";    break;
-    case AppState::Uploading: subtitle = "awaiting text"; break;
-    case AppState::Fault:     subtitle = currentFault.length() ? currentFault : "see phone"; break;
-    default:                  subtitle = phoneStateLabel;  break;
-  }
-
-  drawCenteredHeadline(stateLabel(appState), subtitle, accent);
-  drawStateLine(accent);
-}
+// ----------------------------------------------------------------------------
+// FRAME RENDER
+// ----------------------------------------------------------------------------
 
 static void render() {
-  switch (currentView) {
-    case View::Live:    drawLiveScreen();    break;
-    case View::History: drawHistoryScreen(); break;
-    case View::Info:    drawInfoScreen();    break;
+  StickCP2.Display.fillRect(0, 0, screenW(), ART_Y, COLOR_BG);
+  StickCP2.Display.fillRect(0, ART_Y + ART_SIZE, screenW(), screenH() - (ART_Y + ART_SIZE), COLOR_BG);
+
+  drawTopChrome();
+
+  switch (overlay) {
+    case Overlay::Transcript: drawTranscriptOverlay(); break;
+    case Overlay::Fault:      drawFaultOverlay();      break;
+    case Overlay::Info:       drawInfoOverlay();       break;
+    default:                  drawArtRegion();         break;
   }
-  needsRedraw = false;
+
+  drawBottomChrome();
+
   lastDrawMs = millis();
 }
 
@@ -592,6 +816,7 @@ static void parseControlBytes(const uint8_t* bytes, size_t length) {
   }
   if (controlRxBuffer.startsWith("STATE:") ||
       controlRxBuffer.startsWith("TEXT:") ||
+      controlRxBuffer.startsWith("MOOD:") ||
       controlRxBuffer.startsWith("ERR:")) {
     enqueueControlLine(controlRxBuffer);
     controlRxBuffer = "";
@@ -609,6 +834,7 @@ static bool tryParseBase64Control(const std::string& value) {
 
   if ((decodedLength >= 5 && memcmp(decoded, "TEXT:", 5) == 0) ||
       (decodedLength >= 6 && memcmp(decoded, "STATE:", 6) == 0) ||
+      (decodedLength >= 5 && memcmp(decoded, "MOOD:", 5) == 0) ||
       (decodedLength >= 4 && memcmp(decoded, "ERR:", 4) == 0)) {
     parseControlBytes(decoded, decodedLength);
     return true;
@@ -630,6 +856,10 @@ class ServerCallbacks : public NimBLEServerCallbacks {
     Serial.println("[ble] phone connected");
     phoneConnected = true;
     transition(AppState::Ready);
+    // Tell phone what mood the stick is showing.
+    char buf[32];
+    snprintf(buf, sizeof(buf), "MOOD:%s\n", mood().name);
+    notifyControl(buf);
   }
   void onDisconnect(NimBLEServer*) override {
     Serial.println("[ble] phone disconnected");
@@ -648,6 +878,18 @@ static void handleIncomingLine(const String& line) {
     currentTranscript = line.substring(5);
     pushHistory(currentTranscript);
     transition(AppState::Transcript);
+    showOverlay(Overlay::Transcript, OVERLAY_AUTO_DISMISS_MS);
+    return;
+  }
+
+  if (line.startsWith("MOOD:")) {
+    String name = line.substring(5);
+    name.trim();
+    Mood next;
+    if (moodFromName(name, next)) {
+      // Don't echo back to phone — phone is the source.
+      setMood(next, false);
+    }
     return;
   }
 
@@ -662,13 +904,13 @@ static void handleIncomingLine(const String& line) {
     } else if (label.equalsIgnoreCase("Ready")) {
       if (appState != AppState::Recording) transition(AppState::Ready);
     }
-    requestRedraw();
     return;
   }
 
   if (line.startsWith("ERR:")) {
     currentFault = line.substring(4);
     transition(AppState::Fault);
+    showOverlay(Overlay::Fault, OVERLAY_AUTO_DISMISS_MS);
   }
 }
 
@@ -703,6 +945,7 @@ static void startCapture() {
   if (!phoneConnected) {
     currentFault = "host required";
     transition(AppState::Fault);
+    showOverlay(Overlay::Fault, OVERLAY_AUTO_DISMISS_MS);
     return;
   }
 
@@ -710,6 +953,7 @@ static void startCapture() {
   recordingStartMs = millis();
   notifyControl("START\n");
   transition(AppState::Recording);
+  clearOverlay();
 }
 
 static void stopCapture() {
@@ -725,10 +969,6 @@ static void stopCapture() {
 // ----------------------------------------------------------------------------
 // BUTTONS
 // ----------------------------------------------------------------------------
-
-// We only use isPressed() because higher-level helpers (wasPressed/wasClicked
-// etc.) crash with this lib version of M5Unified. We track edges and gestures
-// ourselves from the raw boolean state.
 
 static constexpr uint32_t DOUBLE_CLICK_WINDOW_MS = 380;
 static constexpr uint32_t LONG_PRESS_MS = 700;
@@ -801,14 +1041,15 @@ static ButtonEvent updateButton(ButtonTracker& t, bool isDown) {
 }
 
 static void handleButtons() {
-  // NOTE: StickCP2.BtnA reference is broken in M5StickCPlus2 1.0.2 (zero-init
-  // in BSS, default ctor never runs at startup). Access M5.BtnA directly.
+  // M5StickCPlus2 1.0.2 has a broken StickCP2.BtnA reference at startup,
+  // so we read M5.BtnA / M5.BtnB raw and track gestures ourselves.
   ButtonEvent a = updateButton(btnA, M5.BtnA.isPressed());
   ButtonEvent b = updateButton(btnB, M5.BtnB.isPressed());
 
-  // ---- BtnA: hold-to-talk + double-click lock ----
+  // ---- Button A: hold to talk + double-click to lock ----
   switch (a) {
     case ButtonEvent::Press:
+      if (overlay != Overlay::None) clearOverlay();
       if (!streaming && !recordingLock) startCapture();
       break;
     case ButtonEvent::Release:
@@ -826,28 +1067,24 @@ static void handleButtons() {
       break;
   }
 
-  // ---- BtnB: cycle view / dismiss / brightness ----
+  // ---- Button B: cycle mood / brightness / info ----
   switch (b) {
     case ButtonEvent::Click:
-      if (currentView == View::History && historyCount > 1) {
-        historyCursor = (historyCursor + 1) % historyCount;
-        requestRedraw();
+      if (overlay != Overlay::None) {
+        clearOverlay();
       } else {
-        cycleView();
+        cycleMood();
       }
       break;
     case ButtonEvent::DoubleClick:
       cycleBrightness();
       break;
     case ButtonEvent::LongPress:
-      currentTranscript = "";
-      currentFault = "";
-      if (phoneConnected && !streaming) {
-        transition(AppState::Ready);
-      } else if (!phoneConnected) {
-        transition(AppState::Standby);
+      if (overlay == Overlay::Info) {
+        clearOverlay();
+      } else {
+        showOverlay(Overlay::Info, 8000);
       }
-      setView(View::Live);
       break;
     default:
       break;
@@ -864,9 +1101,13 @@ void setup() {
 
   auto cfg = M5.config();
   StickCP2.begin(cfg);
-  StickCP2.Display.setRotation(1);
-  StickCP2.Display.setTextDatum(middle_center);
+  StickCP2.Display.setRotation(0);  // portrait — lanyard hole at top, USB at bottom
+  StickCP2.Display.fillScreen(COLOR_BG);
   setBrightnessIndex(brightnessIndex);
+
+  artCanvas.setColorDepth(16);
+  artCanvas.createSprite(ART_SIZE, ART_SIZE);
+  artCanvas.fillSprite(COLOR_BG);
 
   StickCP2.Speaker.end();
   StickCP2.Mic.begin();
@@ -881,29 +1122,45 @@ void loop() {
 
   handleButtons();
 
-  // Capture audio in Recording state
+  // Capture audio in Recording state and compute peak amplitude.
   if (streaming && phoneConnected && StickCP2.Mic.isEnabled()) {
     if (StickCP2.Mic.record(audioBuffer, SAMPLES_PER_CHUNK, SAMPLE_RATE)) {
       notifyAudio(reinterpret_cast<const uint8_t*>(audioBuffer), sizeof(audioBuffer));
+      int32_t peak = 0;
+      for (size_t i = 0; i < SAMPLES_PER_CHUNK; ++i) {
+        int16_t s = audioBuffer[i];
+        int16_t a = s < 0 ? -s : s;
+        if (a > peak) peak = a;
+      }
+      audioPeakRaw = peak;
     }
+  } else {
+    audioPeakRaw = 0;
   }
 
-  // Process incoming control lines from phone
+  // Process incoming control lines from phone.
   String line;
   if (popPendingControlLine(line)) {
     handleIncomingLine(line);
   }
 
-  // Auto-return to Live view after inactivity in History/Info
-  if (currentView != View::Live && millis() - lastViewChangeMs > VIEW_AUTO_RETURN_MS) {
-    setView(View::Live);
+  // Auto-dismiss overlays after their timeout.
+  if (overlay != Overlay::None && millis() > overlayUntilMs) {
+    if (overlay == Overlay::Transcript || overlay == Overlay::Fault) {
+      currentTranscript = "";
+      currentFault = "";
+      if (appState == AppState::Transcript || appState == AppState::Fault) {
+        transition(phoneConnected ? AppState::Ready : AppState::Standby);
+      }
+    }
+    clearOverlay();
   }
 
-  // Throttled redraw for animated views
+  // Frame loop — animate at REDRAW_INTERVAL_MS (~14fps).
   uint32_t now = millis();
-  bool animating = (currentView == View::Live && appState == AppState::Recording) ||
-                   (currentView == View::Info);
-  if (needsRedraw || (animating && now - lastDrawMs > REDRAW_INTERVAL_MS)) {
+  if (now - lastDrawMs >= REDRAW_INTERVAL_MS) {
+    frameCounter++;
+    updateAudioLevel();
     render();
   }
 
