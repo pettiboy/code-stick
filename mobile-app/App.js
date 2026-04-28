@@ -10,12 +10,12 @@ import {
   PermissionsAndroid,
   Platform,
   Pressable,
-  SafeAreaView,
   ScrollView,
   StyleSheet,
   Text,
   View,
 } from 'react-native';
+import { SafeAreaView, useSafeAreaInsets } from 'react-native-safe-area-context';
 import { BleManager } from 'react-native-ble-plx';
 import {
   useFonts as useMajorMono,
@@ -218,6 +218,7 @@ function sessionReducer(state, action) {
 // ---------------------------------------------------------------------------
 
 export default function App() {
+  const insets = useSafeAreaInsets();
   const manager = useMemo(() => new BleManager(), []);
   const [recordingMs, setRecordingMs] = useState(0);
   const [, setTick] = useState(0);
@@ -593,7 +594,7 @@ export default function App() {
 
   if (!fontsLoaded) {
     return (
-      <SafeAreaView style={styles.screen}>
+      <SafeAreaView style={styles.screen} edges={['top', 'left', 'right', 'bottom']}>
         <StatusBar style="light" backgroundColor={C.bg} />
       </SafeAreaView>
     );
@@ -616,7 +617,10 @@ export default function App() {
   const transcriptIsPlaceholder = !transcript;
 
   return (
-    <SafeAreaView style={[styles.screen, { backgroundColor: C.bg }]}>
+    <SafeAreaView
+      style={[styles.screen, { backgroundColor: C.bg }]}
+      edges={['top', 'left', 'right']}
+    >
       <StatusBar style="light" backgroundColor={C.bg} />
       <Atmosphere accent={mood.primary} />
 
@@ -624,7 +628,10 @@ export default function App() {
         style={[styles.body, { opacity: introOpacity, transform: [{ translateY: introY }] }]}
       >
         <ScrollView
-          contentContainerStyle={styles.scroll}
+          contentContainerStyle={[
+            styles.scroll,
+            { paddingBottom: 36 + Math.max(insets.bottom, 12) },
+          ]}
           showsVerticalScrollIndicator={false}
         >
           {/* TOP STRIP */}
@@ -1301,7 +1308,7 @@ const styles = StyleSheet.create({
   scroll: {
     paddingHorizontal: 22,
     paddingTop: 18,
-    paddingBottom: 36,
+    // bottom inset applied inline via useSafeAreaInsets + paddingBottom
   },
 
   gradTop: {
