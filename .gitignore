@@ -11,6 +11,8 @@ Thumbs.db
 .env.*
 !.env.example
 *.pem
+mobile-app/secrets.js
+mobile-app/secrets.local.js
 
 # --- Node / JS (mobile-app and any future packages) ---
 node_modules/
