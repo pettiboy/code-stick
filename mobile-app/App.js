@@ -2,7 +2,7 @@ import { StatusBar } from 'expo-status-bar';
 import * as SecureStore from 'expo-secure-store';
 import { File, Paths } from 'expo-file-system';
 import { Buffer } from 'buffer';
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useEffect, useMemo, useReducer, useRef, useState } from 'react';
 import {
   Alert,
   Animated,
@@ -35,6 +35,8 @@ const CONTROL_UUID = '3e7a0003-e33b-4e2f-9a85-f03e1d33c001';
 const SAMPLE_RATE = 16000;
 const API_KEY_STORAGE_KEY = 'openai_api_key';
 const ROMANIZATION_MODEL = 'gpt-4.1-mini';
+const HISTORY_MAX = 8;
+const HISTORY_STORAGE_KEY = 'transcript_history_v1';
 
 let DEFAULT_OPENAI_API_KEY = '';
 try {
@@ -68,19 +70,111 @@ const FONT = {
   monoBd: 'JetBrainsMono_700Bold',
 };
 
+// ---------------------------------------------------------------------------
+// SESSION STATE — single reducer for the whole link lifecycle
+// ---------------------------------------------------------------------------
+
+const PHASE = {
+  Idle: 'idle',
+  Scanning: 'scanning',
+  Connecting: 'connecting',
+  Linked: 'linked',
+  Recording: 'recording',
+  Uploading: 'uploading',
+};
+
+const initialSession = {
+  phase: PHASE.Idle,
+  status: 'Idle',
+  transcript: '',
+  duration: 0,
+  history: [],
+  fault: null,
+};
+
+function sessionReducer(state, action) {
+  switch (action.type) {
+    case 'SCAN_START':
+      return {
+        ...state,
+        phase: PHASE.Scanning,
+        status: `Scanning · ${DEVICE_NAME}`,
+        fault: null,
+        transcript: '',
+        duration: 0,
+      };
+    case 'SCAN_FAIL':
+      return { ...state, phase: PHASE.Idle, status: action.message };
+    case 'CONNECTING':
+      return { ...state, phase: PHASE.Connecting, status: 'Handshake' };
+    case 'LINKED':
+      return { ...state, phase: PHASE.Linked, status: 'Link established' };
+    case 'DISCONNECT':
+      return {
+        ...state,
+        phase: PHASE.Idle,
+        status: action.reason || 'Link severed',
+      };
+    case 'REC_START':
+      return {
+        ...state,
+        phase: PHASE.Recording,
+        status: 'Capturing audio',
+        transcript: '',
+        duration: 0,
+        fault: null,
+      };
+    case 'REC_STOP':
+      return {
+        ...state,
+        phase: PHASE.Uploading,
+        status: 'Uploading to OpenAI',
+      };
+    case 'TRANSCRIPT_DONE': {
+      const entry = {
+        id: action.id,
+        text: action.text,
+        durationSec: action.duration,
+        at: Date.now(),
+      };
+      return {
+        ...state,
+        phase: PHASE.Linked,
+        status: 'Transcript dispatched',
+        transcript: action.text,
+        duration: action.duration,
+        history: [entry, ...state.history].slice(0, HISTORY_MAX),
+      };
+    }
+    case 'FAULT':
+      return {
+        ...state,
+        phase: state.phase === PHASE.Recording || state.phase === PHASE.Uploading ? PHASE.Linked : state.phase,
+        status: action.message,
+        fault: action.message,
+      };
+    case 'STATUS':
+      return { ...state, status: action.status };
+    case 'HYDRATE_HISTORY':
+      return { ...state, history: action.history };
+    case 'CLEAR_HISTORY':
+      return { ...state, history: [] };
+    default:
+      return state;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// APP
+// ---------------------------------------------------------------------------
+
 export default function App() {
   const manager = useMemo(() => new BleManager(), []);
   const [apiKey, setApiKey] = useState(DEFAULT_OPENAI_API_KEY);
-  const [device, setDevice] = useState(null);
-  const [status, setStatus] = useState('Idle');
-  const [isScanning, setIsScanning] = useState(false);
-  const [isConnected, setIsConnected] = useState(false);
-  const [isRecording, setIsRecording] = useState(false);
-  const [isTranscribing, setIsTranscribing] = useState(false);
-  const [transcript, setTranscript] = useState('');
-  const [transcriptDuration, setTranscriptDuration] = useState(0);
-  const [recordingMs, setRecordingMs] = useState(0);
   const [showApiKey, setShowApiKey] = useState(false);
+  const [recordingMs, setRecordingMs] = useState(0);
+  const [, setTick] = useState(0);
+  const [session, dispatch] = useReducer(sessionReducer, initialSession);
 
   const audioChunksRef = useRef([]);
   const controlLineRef = useRef('');
@@ -89,6 +183,7 @@ export default function App() {
   const isScanningRef = useRef(false);
   const recordingStartRef = useRef(0);
   const recordingTimerRef = useRef(null);
+  const tickIntervalRef = useRef(null);
 
   const [fontsLoaded] = useMajorMono({
     MajorMonoDisplay_400Regular,
@@ -102,9 +197,26 @@ export default function App() {
   const recordingPulse = useRef(new Animated.Value(0)).current;
   const scanRotate = useRef(new Animated.Value(0)).current;
 
+  const { phase, status, transcript, duration, history, fault } = session;
+  const isConnected = phase === PHASE.Linked || phase === PHASE.Recording || phase === PHASE.Uploading;
+  const isScanning = phase === PHASE.Scanning || phase === PHASE.Connecting;
+  const isRecording = phase === PHASE.Recording;
+  const isTranscribing = phase === PHASE.Uploading;
+  const linkDot = isConnected ? C.accent : isScanning ? C.accent : C.muted;
+
+  // Persisted state hydration
   useEffect(() => {
     SecureStore.getItemAsync(API_KEY_STORAGE_KEY).then((stored) => {
       if (stored) setApiKey(stored);
+    });
+    SecureStore.getItemAsync(HISTORY_STORAGE_KEY).then((raw) => {
+      if (!raw) return;
+      try {
+        const parsed = JSON.parse(raw);
+        if (Array.isArray(parsed)) {
+          dispatch({ type: 'HYDRATE_HISTORY', history: parsed.slice(0, HISTORY_MAX) });
+        }
+      } catch (e) {}
     });
 
     return () => {
@@ -114,6 +226,12 @@ export default function App() {
     };
   }, [manager]);
 
+  // Persist history when it changes
+  useEffect(() => {
+    SecureStore.setItemAsync(HISTORY_STORAGE_KEY, JSON.stringify(history)).catch(() => {});
+  }, [history]);
+
+  // Intro animation
   useEffect(() => {
     if (!fontsLoaded) return;
     Animated.parallel([
@@ -132,6 +250,7 @@ export default function App() {
     ]).start();
   }, [fontsLoaded, introOpacity, introY]);
 
+  // Recording pulse
   useEffect(() => {
     if (!isRecording) {
       recordingPulse.setValue(0);
@@ -157,6 +276,7 @@ export default function App() {
     return () => loop.stop();
   }, [isRecording, recordingPulse]);
 
+  // Scan spin
   useEffect(() => {
     if (!isScanning) {
       scanRotate.setValue(0);
@@ -174,6 +294,7 @@ export default function App() {
     return () => loop.stop();
   }, [isScanning, scanRotate]);
 
+  // Recording timer
   useEffect(() => {
     if (isRecording) {
       recordingStartRef.current = Date.now();
@@ -193,6 +314,12 @@ export default function App() {
     };
   }, [isRecording]);
 
+  // Generic re-render tick for "Xs ago" labels
+  useEffect(() => {
+    tickIntervalRef.current = setInterval(() => setTick((n) => n + 1), 5000);
+    return () => clearInterval(tickIntervalRef.current);
+  }, []);
+
   async function saveApiKey(value) {
     setApiKey(value);
     if (value.trim()) {
@@ -210,19 +337,16 @@ export default function App() {
 
     const permitted = await requestBluetoothPermissions();
     if (!permitted) {
-      setStatus('Bluetooth permission denied');
+      dispatch({ type: 'STATUS', status: 'Bluetooth permission denied' });
       return;
     }
 
-    setTranscript('');
-    setTranscriptDuration(0);
-    setStatus(`Scanning · ${DEVICE_NAME}`);
-    setIsScanning(true);
+    dispatch({ type: 'SCAN_START' });
     isScanningRef.current = true;
 
     manager.startDeviceScan([SERVICE_UUID], { allowDuplicates: false }, async (error, scannedDevice) => {
       if (error) {
-        setStatus(error.message);
+        dispatch({ type: 'SCAN_FAIL', message: error.message });
         stopScan();
         return;
       }
@@ -232,26 +356,23 @@ export default function App() {
       }
 
       stopScan();
+      dispatch({ type: 'CONNECTING' });
       try {
-        setStatus('Handshake');
         const connected = await scannedDevice.connect({ requestMTU: 247 });
         const ready = await connected.discoverAllServicesAndCharacteristics();
         deviceRef.current = ready;
-        setDevice(ready);
-        setIsConnected(true);
-        setStatus('Link established');
+        dispatch({ type: 'LINKED' });
         monitorStick(ready);
         await sendControl('STATE:Ready\n', ready);
       } catch (connectError) {
-        setStatus(connectError.message);
-        setIsConnected(false);
+        dispatch({ type: 'SCAN_FAIL', message: connectError.message });
       }
     });
 
     setTimeout(() => {
       if (isScanningRef.current) {
         stopScan();
-        setStatus('Scan timed out');
+        dispatch({ type: 'SCAN_FAIL', message: 'Scan timed out' });
       }
     }, 12000);
   }
@@ -259,7 +380,6 @@ export default function App() {
   function stopScan() {
     manager.stopDeviceScan();
     isScanningRef.current = false;
-    setIsScanning(false);
   }
 
   async function disconnect() {
@@ -270,10 +390,7 @@ export default function App() {
       await deviceRef.current.cancelConnection().catch(() => {});
     }
     deviceRef.current = null;
-    setDevice(null);
-    setIsConnected(false);
-    setIsRecording(false);
-    setStatus('Link severed');
+    dispatch({ type: 'DISCONNECT' });
   }
 
   function monitorStick(connectedDevice) {
@@ -282,7 +399,7 @@ export default function App() {
       CONTROL_UUID,
       (error, characteristic) => {
         if (error) {
-          setStatus(error.message);
+          dispatch({ type: 'STATUS', status: error.message });
           return;
         }
         handleControlValue(characteristic?.value);
@@ -294,7 +411,7 @@ export default function App() {
       AUDIO_UUID,
       (error, characteristic) => {
         if (error) {
-          setStatus(error.message);
+          dispatch({ type: 'STATUS', status: error.message });
           return;
         }
         if (!characteristic?.value) return;
@@ -322,9 +439,7 @@ export default function App() {
   function handleControlLine(line) {
     if (line === 'START') {
       audioChunksRef.current = [];
-      setTranscript('');
-      setIsRecording(true);
-      setStatus('Capturing audio');
+      dispatch({ type: 'REC_START' });
       sendControl('STATE:Recording\n');
       return;
     }
@@ -333,22 +448,20 @@ export default function App() {
       const chunks = audioChunksRef.current.slice();
       audioChunksRef.current = [];
       const elapsedMs = Date.now() - recordingStartRef.current;
-      setIsRecording(false);
+      dispatch({ type: 'REC_STOP' });
       transcribeChunks(chunks, elapsedMs);
     }
   }
 
   async function transcribeChunks(chunks, durationMs) {
     if (!chunks.length) {
-      setStatus('No audio received');
+      dispatch({ type: 'FAULT', message: 'No audio received' });
       await sendControl('ERR:No audio\n');
       return;
     }
 
     let wavFile = null;
     try {
-      setIsTranscribing(true);
-      setStatus('Uploading to OpenAI');
       await sendControl('STATE:Transcribing\n');
 
       const wav = buildWav(chunks);
@@ -388,15 +501,18 @@ export default function App() {
 
       const rawText = payload.text?.trim() || '(No speech detected)';
       const text = await ensureLatinScript(rawText, apiKey.trim());
-      setTranscript(text);
-      setTranscriptDuration(Math.max(0, Math.round(durationMs / 100) / 10));
-      setStatus('Transcript dispatched');
+      const durationSec = Math.max(0, Math.round(durationMs / 100) / 10);
+      dispatch({
+        type: 'TRANSCRIPT_DONE',
+        id: Date.now(),
+        text,
+        duration: durationSec,
+      });
       await sendControl(`TEXT:${sanitizeControlText(text)}\n`);
     } catch (error) {
-      setStatus(error.message);
+      dispatch({ type: 'FAULT', message: error.message });
       await sendControl(`ERR:${sanitizeControlText(error.message)}\n`);
     } finally {
-      setIsTranscribing(false);
       if (wavFile) {
         try {
           wavFile.delete();
@@ -405,7 +521,7 @@ export default function App() {
     }
   }
 
-  async function sendControl(message, targetDevice = deviceRef.current || device) {
+  async function sendControl(message, targetDevice = deviceRef.current) {
     if (!targetDevice) {
       console.warn('[ctrl->] no device, drop:', message.trim());
       return;
@@ -424,7 +540,7 @@ export default function App() {
       }
     } catch (writeError) {
       console.warn('[ctrl->] write failed:', writeError?.message || writeError);
-      setStatus(`BLE write failed: ${writeError?.message || writeError}`);
+      dispatch({ type: 'STATUS', status: `BLE write failed: ${writeError?.message || writeError}` });
     }
   }
 
@@ -436,10 +552,27 @@ export default function App() {
     );
   }
 
-  const linkLabel = isConnected ? 'LINK · LIVE' : isScanning ? 'LINK · SEARCH' : 'LINK · IDLE';
-  const linkDot = isConnected ? C.accent : isScanning ? C.accent : C.muted;
-  const transcriptText = transcript || 'await · transmission';
-  const transcriptIsPlaceholder = !transcript;
+  const linkLabel = (() => {
+    switch (phase) {
+      case PHASE.Linked:
+      case PHASE.Recording:
+      case PHASE.Uploading:
+        return 'LINK · LIVE';
+      case PHASE.Scanning:
+        return 'LINK · SEARCH';
+      case PHASE.Connecting:
+        return 'LINK · NEGOT';
+      default:
+        return 'LINK · IDLE';
+    }
+  })();
+
+  const buttonLabel = (() => {
+    if (isTranscribing) return 'PROCESSING…';
+    if (isScanning) return 'SCANNING…';
+    if (isConnected) return 'SEVER LINK';
+    return 'INITIALIZE LINK';
+  })();
 
   const recordingScale = recordingPulse.interpolate({
     inputRange: [0, 1],
@@ -454,13 +587,8 @@ export default function App() {
     outputRange: ['0deg', '360deg'],
   });
 
-  const buttonLabel = isScanning
-    ? 'SCANNING…'
-    : isTranscribing
-    ? 'PROCESSING…'
-    : isConnected
-    ? 'SEVER LINK'
-    : 'INITIALIZE LINK';
+  const transcriptText = transcript || 'await · transmission';
+  const transcriptIsPlaceholder = !transcript;
 
   return (
     <SafeAreaView style={styles.screen}>
@@ -501,7 +629,7 @@ export default function App() {
             <Text style={styles.heroLine1}>field</Text>
             <Text style={styles.heroLine2}>transmitter</Text>
             <View style={styles.heroMetaRow}>
-              <Text style={styles.heroMeta}>v0.1 · push-to-talk · ble 4.2</Text>
+              <Text style={styles.heroMeta}>v0.2 · push-to-talk · ble 4.2</Text>
               <View style={styles.heroBars}>
                 {[0, 1, 2, 3, 4].map((i) => (
                   <View
@@ -560,9 +688,15 @@ export default function App() {
           >
             <View style={styles.primaryEdge} />
             <View style={styles.primaryRow}>
-              <Text style={styles.primaryGlyph}>{isConnected ? '◇' : '◆'}</Text>
-              <Text style={styles.primaryLabel}>{buttonLabel}</Text>
-              <Text style={styles.primaryGlyph}>{isConnected ? '◇' : '◆'}</Text>
+              <Text style={[styles.primaryGlyph, isConnected && styles.primaryGlyphActive]}>
+                {isConnected ? '◇' : '◆'}
+              </Text>
+              <Text style={[styles.primaryLabel, isConnected && styles.primaryLabelActive]}>
+                {buttonLabel}
+              </Text>
+              <Text style={[styles.primaryGlyph, isConnected && styles.primaryGlyphActive]}>
+                {isConnected ? '◇' : '◆'}
+              </Text>
             </View>
           </Pressable>
 
@@ -587,7 +721,7 @@ export default function App() {
                   <View style={[styles.recDot, { backgroundColor: C.hairline }]} />
                 )}
                 <Text style={[styles.recLabel, isRecording && { color: C.danger }]}>
-                  {isRecording ? 'REC' : 'STBY'}
+                  {isRecording ? 'REC' : isTranscribing ? 'UPLNK' : 'STBY'}
                 </Text>
               </View>
 
@@ -616,8 +750,15 @@ export default function App() {
             </View>
 
             <View style={styles.statusLine}>
-              <View style={[styles.statusDot, { backgroundColor: linkDot }]} />
-              <Text style={styles.statusText}>{status}</Text>
+              <View
+                style={[
+                  styles.statusDot,
+                  { backgroundColor: fault ? C.danger : linkDot },
+                ]}
+              />
+              <Text style={styles.statusText} numberOfLines={2}>
+                {fault || status}
+              </Text>
             </View>
           </Panel>
 
@@ -626,7 +767,7 @@ export default function App() {
             <View style={styles.transcriptHead}>
               <Text style={styles.transcriptLabel}>transcript</Text>
               <Text style={styles.transcriptMeta}>
-                {transcript ? `${transcriptDuration.toFixed(1)}s · ok` : '— · —'}
+                {transcript ? `${duration.toFixed(1)}s · ok` : '— · —'}
               </Text>
             </View>
 
@@ -654,15 +795,62 @@ export default function App() {
             </View>
           </View>
 
+          {/* HISTORY */}
+          <Panel
+            label="archive"
+            right={
+              history.length > 0 ? (
+                <Pressable
+                  hitSlop={8}
+                  onPress={() => dispatch({ type: 'CLEAR_HISTORY' })}
+                >
+                  <Text style={styles.panelMeta}>clear ✕</Text>
+                </Pressable>
+              ) : (
+                <Text style={styles.panelMeta}>{history.length} / {HISTORY_MAX}</Text>
+              )
+            }
+          >
+            {history.length === 0 ? (
+              <Text style={styles.archiveEmpty}>
+                no transmissions · hold the m5 button to capture
+              </Text>
+            ) : (
+              <View style={styles.archiveList}>
+                {history.map((entry, index) => (
+                  <View key={entry.id} style={styles.archiveRow}>
+                    <View style={styles.archiveMeta}>
+                      <Text style={styles.archiveIndex}>{String(index + 1).padStart(2, '0')}</Text>
+                      <Text style={styles.archiveAge}>{relativeTime(entry.at)}</Text>
+                      <Text style={styles.archiveDuration}>
+                        {entry.durationSec.toFixed(1)}s
+                      </Text>
+                    </View>
+                    <Text style={styles.archiveText} numberOfLines={3} selectable>
+                      {entry.text}
+                    </Text>
+                  </View>
+                ))}
+              </View>
+            )}
+          </Panel>
+
+          {/* CONTROLS HINT */}
           <View style={styles.bottomRule} />
-          <Text style={styles.colophon}>
-            ⌁ hold the m5 button · speak · release ⌁
-          </Text>
+          <View style={styles.legend}>
+            <LegendRow glyph="A" label="hold · talk     dbl · lock" />
+            <LegendRow glyph="B" label="tap · view      hold · clear" />
+            <LegendRow glyph="B" label="dbl · brightness" />
+          </View>
         </ScrollView>
       </Animated.View>
     </SafeAreaView>
   );
 }
+
+// ---------------------------------------------------------------------------
+// COMPONENTS
+// ---------------------------------------------------------------------------
 
 function Panel({ label, right, children }) {
   return (
@@ -695,6 +883,21 @@ function Grain() {
     </View>
   );
 }
+
+function LegendRow({ glyph, label }) {
+  return (
+    <View style={styles.legendRow}>
+      <View style={styles.legendKey}>
+        <Text style={styles.legendKeyText}>{glyph}</Text>
+      </View>
+      <Text style={styles.legendLabel}>{label}</Text>
+    </View>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// HELPERS
+// ---------------------------------------------------------------------------
 
 async function requestBluetoothPermissions() {
   if (Platform.OS !== 'android') return true;
@@ -764,6 +967,19 @@ function formatDuration(ms) {
   return `${mm}:${ss}.${tenths}`;
 }
 
+function relativeTime(timestamp) {
+  const diffMs = Date.now() - timestamp;
+  const seconds = Math.floor(diffMs / 1000);
+  if (seconds < 5) return 'now';
+  if (seconds < 60) return `${seconds}s ago`;
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes}m ago`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `${hours}h ago`;
+  const days = Math.floor(hours / 24);
+  return `${days}d ago`;
+}
+
 async function ensureLatinScript(text, apiKey) {
   if (!containsNonLatinScript(text) || !apiKey) {
     return text;
@@ -823,6 +1039,10 @@ function bytesToBase64(bytes) {
   return output;
 }
 
+// ---------------------------------------------------------------------------
+// STYLES
+// ---------------------------------------------------------------------------
+
 const styles = StyleSheet.create({
   screen: {
     flex: 1,
@@ -837,7 +1057,6 @@ const styles = StyleSheet.create({
     paddingBottom: 36,
   },
 
-  // BG VIGNETTE
   gradTop: {
     position: 'absolute',
     top: 0,
@@ -857,7 +1076,6 @@ const styles = StyleSheet.create({
     opacity: 0.7,
   },
 
-  // TOP BAR
   topBar: {
     flexDirection: 'row',
     alignItems: 'center',
@@ -895,7 +1113,6 @@ const styles = StyleSheet.create({
     transform: [{ rotate: '45deg' }],
   },
 
-  // HERO
   hero: {
     paddingTop: 8,
     paddingBottom: 28,
@@ -941,7 +1158,6 @@ const styles = StyleSheet.create({
     width: 3,
   },
 
-  // PANEL
   panel: {
     backgroundColor: C.surface,
     borderColor: C.hairline,
@@ -977,7 +1193,6 @@ const styles = StyleSheet.create({
     paddingTop: 2,
   },
 
-  // INPUT
   inputRow: {
     flexDirection: 'row',
     alignItems: 'center',
@@ -1007,7 +1222,6 @@ const styles = StyleSheet.create({
     letterSpacing: 2,
   },
 
-  // PRIMARY BUTTON
   primary: {
     position: 'relative',
     backgroundColor: C.accent,
@@ -1048,13 +1262,18 @@ const styles = StyleSheet.create({
     fontSize: 14,
     letterSpacing: 3,
   },
+  primaryLabelActive: {
+    color: C.accent,
+  },
   primaryGlyph: {
     color: C.bg,
     fontFamily: FONT.monoBd,
     fontSize: 14,
   },
+  primaryGlyphActive: {
+    color: C.accent,
+  },
 
-  // CHANNEL
   channelRow: {
     flexDirection: 'row',
     alignItems: 'center',
@@ -1132,7 +1351,6 @@ const styles = StyleSheet.create({
     flex: 1,
   },
 
-  // TRANSCRIPT
   transcript: {
     position: 'relative',
     backgroundColor: C.surfaceAlt,
@@ -1198,7 +1416,54 @@ const styles = StyleSheet.create({
     letterSpacing: 1.6,
   },
 
-  // CORNERS
+  archiveEmpty: {
+    color: C.muted,
+    fontFamily: FONT.mono,
+    fontSize: 12,
+    letterSpacing: 1.4,
+    paddingVertical: 6,
+  },
+  archiveList: {
+    gap: 12,
+  },
+  archiveRow: {
+    paddingTop: 10,
+    borderTopWidth: StyleSheet.hairlineWidth,
+    borderTopColor: C.hairlineSoft,
+  },
+  archiveMeta: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 10,
+    paddingBottom: 6,
+  },
+  archiveIndex: {
+    color: C.accent,
+    fontFamily: FONT.monoBd,
+    fontSize: 11,
+    letterSpacing: 1.6,
+  },
+  archiveAge: {
+    color: C.fgDim,
+    fontFamily: FONT.mono,
+    fontSize: 10,
+    letterSpacing: 1.2,
+    flex: 1,
+  },
+  archiveDuration: {
+    color: C.muted,
+    fontFamily: FONT.mono,
+    fontSize: 10,
+    letterSpacing: 1.2,
+  },
+  archiveText: {
+    color: C.fg,
+    fontFamily: FONT.monoMd,
+    fontSize: 14,
+    lineHeight: 20,
+    letterSpacing: 0.3,
+  },
+
   corner: {
     position: 'absolute',
     width: 10,
@@ -1235,11 +1500,32 @@ const styles = StyleSheet.create({
     backgroundColor: C.hairline,
     marginBottom: 12,
   },
-  colophon: {
+  legend: {
+    gap: 6,
+    paddingTop: 4,
+  },
+  legendRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 12,
+  },
+  legendKey: {
+    width: 22,
+    height: 22,
+    borderWidth: 1,
+    borderColor: C.accent,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  legendKeyText: {
+    color: C.accent,
+    fontFamily: FONT.monoBd,
+    fontSize: 11,
+  },
+  legendLabel: {
     color: C.muted,
     fontFamily: FONT.mono,
     fontSize: 10,
-    letterSpacing: 2.2,
-    textAlign: 'center',
+    letterSpacing: 1.6,
   },
 });
