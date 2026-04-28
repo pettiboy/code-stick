@@ -1,0 +1,46 @@
+{
+  "expo": {
+    "name": "M5 Voice Stick",
+    "slug": "m5-voice-stick",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "icon": "./assets/icon.png",
+    "userInterfaceStyle": "light",
+    "newArchEnabled": true,
+    "splash": {
+      "image": "./assets/splash-icon.png",
+      "resizeMode": "contain",
+      "backgroundColor": "#ffffff"
+    },
+    "ios": {
+      "supportsTablet": true,
+      "bundleIdentifier": "com.example.m5voicestick",
+      "infoPlist": {
+        "NSBluetoothAlwaysUsageDescription": "M5 Voice Stick uses Bluetooth to receive audio from your M5StickC Plus2.",
+        "NSMicrophoneUsageDescription": "Microphone access is reserved for future phone-mic fallback recording."
+      }
+    },
+    "android": {
+      "package": "com.example.m5voicestick",
+      "permissions": [
+        "android.permission.BLUETOOTH",
+        "android.permission.BLUETOOTH_ADMIN",
+        "android.permission.BLUETOOTH_SCAN",
+        "android.permission.BLUETOOTH_CONNECT",
+        "android.permission.ACCESS_FINE_LOCATION",
+        "android.permission.INTERNET"
+      ],
+      "adaptiveIcon": {
+        "foregroundImage": "./assets/adaptive-icon.png",
+        "backgroundColor": "#ffffff"
+      },
+      "edgeToEdgeEnabled": true
+    },
+    "web": {
+      "favicon": "./assets/favicon.png"
+    },
+    "plugins": [
+      "expo-secure-store"
+    ]
+  }
+}

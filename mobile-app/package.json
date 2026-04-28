@@ -1,0 +1,24 @@
+{
+  "name": "mobile-app",
+  "version": "1.0.0",
+  "main": "index.js",
+  "scripts": {
+    "start": "expo start",
+    "android": "expo run:android",
+    "ios": "expo run:ios",
+    "web": "expo start --web",
+    "prebuild": "expo prebuild",
+    "run:android": "expo run:android",
+    "run:ios": "expo run:ios"
+  },
+  "dependencies": {
+    "buffer": "^6.0.3",
+    "expo": "~54.0.33",
+    "expo-secure-store": "~15.0.8",
+    "expo-status-bar": "~3.0.9",
+    "react": "19.1.0",
+    "react-native": "0.81.5",
+    "react-native-ble-plx": "^3.5.1"
+  },
+  "private": true
+}
