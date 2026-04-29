@@ -761,6 +761,9 @@ struct ButtonTracker {
 
 static ButtonTracker btnA;
 static ButtonTracker btnB;
+static ButtonTracker btnExt;
+
+static constexpr uint8_t EXT_BTN_PIN = 26;
 
 enum class ButtonEvent : uint8_t {
   None,
@@ -821,9 +824,32 @@ static void handleButtons() {
   // so we read M5.BtnA / M5.BtnB raw and track gestures ourselves.
   ButtonEvent a = updateButton(btnA, M5.BtnA.isPressed());
   ButtonEvent b = updateButton(btnB, M5.BtnB.isPressed());
+  ButtonEvent ext = updateButton(btnExt, digitalRead(EXT_BTN_PIN) == LOW);
 
   // ---- Button A: hold to talk + double-click to lock. Always available. ----
   switch (a) {
+    case ButtonEvent::Press:
+      if (overlay != Overlay::None) clearOverlay();
+      if (!streaming && !recordingLock) startCapture();
+      break;
+    case ButtonEvent::Release:
+      if (streaming && !recordingLock) stopCapture();
+      break;
+    case ButtonEvent::DoubleClick:
+      if (streaming) {
+        stopCapture();
+      } else {
+        if (overlay != Overlay::None) clearOverlay();
+        recordingLock = true;
+        startCapture();
+      }
+      break;
+    default:
+      break;
+  }
+
+  // ---- Ext button (G26 + GND): mirrors Button A ----
+  switch (ext) {
     case ButtonEvent::Press:
       if (overlay != Overlay::None) clearOverlay();
       if (!streaming && !recordingLock) startCapture();
@@ -885,6 +911,8 @@ void setup() {
   screenCanvas.setColorDepth(16);
   screenCanvas.createSprite(SCREEN_W, SCREEN_H);
   screenCanvas.fillSprite(COLOR_BG);
+
+  pinMode(EXT_BTN_PIN, INPUT_PULLUP);
 
   StickCP2.Speaker.end();
   StickCP2.Mic.begin();
