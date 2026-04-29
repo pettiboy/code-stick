@@ -1,11 +1,13 @@
 import { StatusBar } from 'expo-status-bar';
 import * as SecureStore from 'expo-secure-store';
+import * as Notifications from 'expo-notifications';
 import { File, Paths } from 'expo-file-system';
 import { Buffer } from 'buffer';
 import { useEffect, useMemo, useReducer, useRef, useState } from 'react';
 import {
   Alert,
   Animated,
+  AppState,
   Easing,
   PermissionsAndroid,
   Platform,
@@ -45,6 +47,16 @@ try {
   DEFAULT_OPENAI_API_KEY = '';
 }
 
+Notifications.setNotificationHandler({
+  handleNotification: async () => ({
+    shouldShowBanner: true,
+    shouldShowList: true,
+    shouldShowAlert: true,
+    shouldPlaySound: true,
+    shouldSetBadge: false,
+  }),
+});
+
 // ---------------------------------------------------------------------------
 // THEME
 // ---------------------------------------------------------------------------
@@ -77,17 +89,17 @@ const FONT = {
 // ---------------------------------------------------------------------------
 
 const MOODS = [
-  { id: 'PULSE',  label: 'pulse',  vibe: 'alive',     primary: '#FF8030', shade: '#5A2F0F' },
-  { id: 'BLOOM',  label: 'bloom',  vibe: 'in love',   primary: '#FF50A0', shade: '#5A1F45' },
-  { id: 'DRIFT',  label: 'drift',  vibe: 'calm',      primary: '#50A0FF', shade: '#1F3D5A' },
-  { id: 'STATIC', label: 'static', vibe: 'anxious',   primary: '#E8E8E8', shade: '#3F3F3F' },
-  { id: 'STORM',  label: 'storm',  vibe: 'angry',     primary: '#FF3030', shade: '#5A1212' },
-  { id: 'ORBIT',  label: 'orbit',  vibe: 'curious',   primary: '#A080FF', shade: '#322857' },
-  { id: 'GRID',   label: 'grid',   vibe: 'focused',   primary: '#B0FF45', shade: '#3D5A1A' },
-  { id: 'PRISM',  label: 'prism',  vibe: 'party',     primary: '#FFD040', shade: '#5A4710' },
+  { id: 'HAPPY',    label: 'happy',   vibe: 'joyful',   primary: '#FFD040', shade: '#5A4710', accent: '#FFD040' },
+  { id: 'LOVE',     label: 'love',    vibe: 'smitten',  primary: '#FF50A0', shade: '#5A1F45', accent: '#FF3030' },
+  { id: 'SAD',      label: 'sad',     vibe: 'blue',     primary: '#50A0FF', shade: '#1F3D5A', accent: '#50A0FF' },
+  { id: 'WINK',     label: 'wink',    vibe: 'flirty',   primary: '#FFD040', shade: '#5A4710', accent: '#FFD040' },
+  { id: 'SURPRISE', label: 'whoa',    vibe: 'shocked',  primary: '#ECEAE3', shade: '#3F3F3F', accent: '#ECEAE3' },
+  { id: 'SLEEPY',   label: 'sleepy',  vibe: 'tired',    primary: '#B0A0E0', shade: '#322857', accent: '#B0A0E0' },
+  { id: 'ANGRY',    label: 'angry',   vibe: 'mad',      primary: '#FF3030', shade: '#5A1212', accent: '#FFB347' },
+  { id: 'CHILL',    label: 'chill',   vibe: 'easy',     primary: '#9FE383', shade: '#3D5A1A', accent: '#9FE383' },
 ];
 
-const moodById = (id) => MOODS.find((m) => m.id === id) || MOODS[6];
+const moodById = (id) => MOODS.find((m) => m.id === id) || MOODS[0];
 
 // Lightweight transcript-to-mood suggestion based on keyword cues.
 // Returns a mood id, or null if nothing strong matched.
@@ -96,14 +108,14 @@ function suggestMoodFromText(text) {
   const t = text.toLowerCase();
   const has = (re) => re.test(t);
 
-  if (has(/\b(love|loving|kiss|heart|adore|crush|miss you|sweetheart|babe|honey)\b/)) return 'BLOOM';
-  if (has(/\b(angry|mad|hate|furious|annoy|wtf|damn|stupid|hell)\b/)) return 'STORM';
-  if (has(/\b(sad|cry|lonely|sorry|tired|exhaust|hurt|miss|gone|broken)\b/)) return 'DRIFT';
-  if (has(/\b(happy|yay|great|awesome|amazing|nice|good|cool|haha|lol|fun)\b/)) return 'PULSE';
-  if (has(/\b(why|what|how|when|where|who|wonder|curious|maybe|hmm|think)\b/)) return 'ORBIT';
-  if (has(/\b(party|dance|drink|celebrate|birthday|cheers|let'?s go|woo)\b/)) return 'PRISM';
-  if (has(/\b(scared|worried|nervous|anxious|panic|stress|weird|creepy)\b/)) return 'STATIC';
-  if (has(/\b(focus|work|task|todo|plan|build|fix|done|ship)\b/)) return 'GRID';
+  if (has(/\b(love|loving|kiss|heart|adore|crush|sweetheart|babe|honey|miss you)\b/)) return 'LOVE';
+  if (has(/\b(angry|mad|hate|furious|annoy|wtf|damn|stupid|hell)\b/)) return 'ANGRY';
+  if (has(/\b(sad|cry|lonely|sorry|hurt|gone|broken|miss)\b/)) return 'SAD';
+  if (has(/\b(wow|whoa|omg|really|seriously|no way|what\?|insane)\b/)) return 'SURPRISE';
+  if (has(/\b(tired|sleep|exhausted|nap|bed|yawn|zzz|sleepy)\b/)) return 'SLEEPY';
+  if (has(/\b(chill|relax|calm|easy|fine|alright|whatever|cool)\b/)) return 'CHILL';
+  if (has(/\b(wink|flirt|cute|hey there|sup|hi cutie)\b/)) return 'WINK';
+  if (has(/\b(happy|yay|great|awesome|amazing|nice|good|haha|lol|fun)\b/)) return 'HAPPY';
   return null;
 }
 
@@ -228,11 +240,13 @@ export default function App() {
   const controlLineRef = useRef('');
   const subscriptionsRef = useRef([]);
   const deviceRef = useRef(null);
+  const disconnectSubRef = useRef(null);
   const isScanningRef = useRef(false);
   const recordingStartRef = useRef(0);
   const recordingTimerRef = useRef(null);
   const tickIntervalRef = useRef(null);
   const sessionRef = useRef(session);
+  const appStateRef = useRef(AppState.currentState);
 
   useEffect(() => {
     sessionRef.current = session;
@@ -256,6 +270,27 @@ export default function App() {
   const isScanning = phase === PHASE.Scanning || phase === PHASE.Connecting;
   const isRecording = phase === PHASE.Recording;
   const isTranscribing = phase === PHASE.Uploading;
+
+  // Notification permission + AppState tracking
+  useEffect(() => {
+    Notifications.getPermissionsAsync()
+      .then(({ status }) => {
+        if (status !== 'granted') return Notifications.requestPermissionsAsync();
+      })
+      .catch(() => {});
+
+    if (Platform.OS === 'android') {
+      Notifications.setNotificationChannelAsync('link', {
+        name: 'Link status',
+        importance: Notifications.AndroidImportance.HIGH,
+      }).catch(() => {});
+    }
+
+    const sub = AppState.addEventListener('change', (next) => {
+      appStateRef.current = next;
+    });
+    return () => sub.remove();
+  }, []);
 
   // Persisted state hydration
   useEffect(() => {
@@ -397,6 +432,9 @@ export default function App() {
         const connected = await scannedDevice.connect({ requestMTU: 247 });
         const ready = await connected.discoverAllServicesAndCharacteristics();
         deviceRef.current = ready;
+        disconnectSubRef.current = ready.onDisconnected((err) => {
+          handleDeviceDisconnected(err);
+        });
         dispatch({ type: 'LINKED' });
         monitorStick(ready);
         await sendControl('STATE:Ready\n', ready);
@@ -422,6 +460,10 @@ export default function App() {
 
   async function disconnect() {
     stopScan();
+    if (disconnectSubRef.current) {
+      disconnectSubRef.current.remove();
+      disconnectSubRef.current = null;
+    }
     subscriptionsRef.current.forEach((subscription) => subscription.remove());
     subscriptionsRef.current = [];
     if (deviceRef.current) {
@@ -429,6 +471,29 @@ export default function App() {
     }
     deviceRef.current = null;
     dispatch({ type: 'DISCONNECT' });
+  }
+
+  function handleDeviceDisconnected(error) {
+    if (disconnectSubRef.current) {
+      disconnectSubRef.current.remove();
+      disconnectSubRef.current = null;
+    }
+    subscriptionsRef.current.forEach((subscription) => subscription.remove());
+    subscriptionsRef.current = [];
+    deviceRef.current = null;
+    const reason = error?.message ? `link severed · ${error.message}` : 'link severed';
+    dispatch({ type: 'DISCONNECT', reason });
+    if (appStateRef.current !== 'active') {
+      Notifications.scheduleNotificationAsync({
+        content: {
+          title: 'M5 Voice Stick',
+          body: 'Link severed · open app to reconnect',
+          sound: 'default',
+          ...(Platform.OS === 'android' ? { channelId: 'link' } : {}),
+        },
+        trigger: null,
+      }).catch(() => {});
+    }
   }
 
   function monitorStick(connectedDevice) {
@@ -871,222 +936,257 @@ export default function App() {
 }
 
 // ---------------------------------------------------------------------------
-// MOOD GLYPH — a unique abstract signature per mood, built from plain Views.
-// Used both as the big hero preview and the small tile icons.
+// MOOD GLYPH — face expressions composed from plain Views.
 // ---------------------------------------------------------------------------
+
+function Eye({ color, size }) {
+  return (
+    <View style={{
+      width: size, height: size, borderRadius: size / 2,
+      backgroundColor: color,
+    }}/>
+  );
+}
+
+function RingEye({ color, size }) {
+  return (
+    <View style={{
+      width: size, height: size, borderRadius: size / 2,
+      borderWidth: 2, borderColor: color,
+      alignItems: 'center', justifyContent: 'center',
+    }}>
+      <View style={{
+        width: size * 0.38, height: size * 0.38, borderRadius: size * 0.19,
+        backgroundColor: color,
+      }}/>
+    </View>
+  );
+}
+
+function ClosedEye({ color, width }) {
+  return (
+    <View style={{
+      width, height: width * 0.4,
+      borderBottomLeftRadius: width / 2,
+      borderBottomRightRadius: width / 2,
+      borderBottomWidth: 2,
+      borderLeftWidth: 2,
+      borderRightWidth: 2,
+      borderColor: color,
+    }}/>
+  );
+}
+
+function Smile({ color, width, height, thickness = 2.5 }) {
+  return (
+    <View style={{
+      width, height,
+      borderBottomLeftRadius: width / 2,
+      borderBottomRightRadius: width / 2,
+      borderBottomWidth: thickness,
+      borderLeftWidth: thickness,
+      borderRightWidth: thickness,
+      borderColor: color,
+    }}/>
+  );
+}
+
+function Frown({ color, width, height, thickness = 2.5 }) {
+  return (
+    <View style={{
+      width, height,
+      borderTopLeftRadius: width / 2,
+      borderTopRightRadius: width / 2,
+      borderTopWidth: thickness,
+      borderLeftWidth: thickness,
+      borderRightWidth: thickness,
+      borderColor: color,
+    }}/>
+  );
+}
+
+function StraightMouth({ color, width, thickness = 2.5 }) {
+  return (
+    <View style={{
+      width, height: thickness,
+      backgroundColor: color,
+      borderRadius: thickness / 2,
+    }}/>
+  );
+}
+
+function OMouth({ color, size, thickness = 2.5 }) {
+  return (
+    <View style={{
+      width: size, height: size, borderRadius: size / 2,
+      borderWidth: thickness, borderColor: color,
+    }}/>
+  );
+}
+
+function Heart({ color, size }) {
+  const lobe = size * 0.58;
+  const lobeR = lobe / 2;
+  const triH = size * 0.62;
+  return (
+    <View style={{ width: size, height: lobeR + triH * 0.85 }}>
+      <View style={{
+        position: 'absolute', left: 0, top: 0,
+        width: lobe, height: lobe, borderRadius: lobeR,
+        backgroundColor: color,
+      }}/>
+      <View style={{
+        position: 'absolute', right: 0, top: 0,
+        width: lobe, height: lobe, borderRadius: lobeR,
+        backgroundColor: color,
+      }}/>
+      <View style={{
+        position: 'absolute', left: 0, top: lobeR * 0.55,
+        width: 0, height: 0,
+        borderLeftWidth: size / 2,
+        borderRightWidth: size / 2,
+        borderTopWidth: triH,
+        borderLeftColor: 'transparent',
+        borderRightColor: 'transparent',
+        borderTopColor: color,
+      }}/>
+    </View>
+  );
+}
 
 function MoodGlyph({ mood, size = 80, dim = false }) {
   const fade = dim ? 0.55 : 1;
-  const inner = size * 0.7;
+  const c = mood.primary;
+  const accent = mood.accent || c;
+
+  const eyeSize = size * 0.21;
+  const eyeGap = size * 0.18;
+  const mouthW = size * 0.52;
+  const mouthH = size * 0.22;
+
+  const wrap = {
+    width: size, height: size,
+    alignItems: 'center', justifyContent: 'center',
+    opacity: fade,
+  };
+  const eyesRow = {
+    flexDirection: 'row',
+    gap: eyeGap,
+    alignItems: 'center',
+    marginBottom: size * 0.10,
+  };
 
   switch (mood.id) {
-    case 'PULSE':
+    case 'HAPPY':
       return (
-        <View style={[gs.wrap, { width: size, height: size, opacity: fade }]}>
-          {[0.95, 0.7, 0.45, 0.22].map((s, i) => (
-            <View
-              key={i}
-              style={[
-                gs.absRing,
-                {
-                  width: size * s,
-                  height: size * s,
-                  borderRadius: (size * s) / 2,
-                  borderColor: mood.primary,
-                  borderWidth: i === 3 ? 0 : 1,
-                  backgroundColor: i === 3 ? mood.primary : 'transparent',
-                  opacity: 0.3 + (1 - s) * 0.7,
-                },
-              ]}
-            />
-          ))}
+        <View style={wrap}>
+          <View style={eyesRow}>
+            <Eye color={c} size={eyeSize}/>
+            <Eye color={c} size={eyeSize}/>
+          </View>
+          <Smile color={c} width={mouthW} height={mouthH} thickness={size * 0.04}/>
         </View>
       );
 
-    case 'BLOOM':
+    case 'LOVE':
       return (
-        <View style={[gs.wrap, { width: size, height: size, opacity: fade }]}>
-          {[0, 60, 120, 180, 240, 300].map((deg) => (
-            <View
-              key={deg}
-              style={[
-                gs.absDot,
-                {
-                  transform: [
-                    { rotate: `${deg}deg` },
-                    { translateY: -inner / 2.5 },
-                  ],
-                  width: size / 5.5,
-                  height: size / 5.5,
-                  borderRadius: size / 11,
-                  backgroundColor: mood.primary,
-                },
-              ]}
-            />
-          ))}
-          <View style={{
-            width: size / 4,
-            height: size / 4,
-            borderRadius: size / 8,
-            backgroundColor: mood.primary,
-          }} />
+        <View style={wrap}>
+          <View style={eyesRow}>
+            <Heart color={accent} size={eyeSize * 1.25}/>
+            <Heart color={accent} size={eyeSize * 1.25}/>
+          </View>
+          <Smile color={c} width={mouthW * 0.95} height={mouthH * 0.9} thickness={size * 0.04}/>
         </View>
       );
 
-    case 'DRIFT':
+    case 'SAD':
       return (
-        <View style={[gs.wrapColumn, { width: size, height: size, opacity: fade }]}>
-          {[0, 1, 2].map((i) => (
-            <View
-              key={i}
-              style={{
-                width: size * 0.85,
-                height: 2,
-                backgroundColor: mood.primary,
-                marginVertical: size * 0.08,
-                opacity: i === 1 ? 1 : 0.5,
-                borderRadius: 1,
-                transform: [
-                  { rotate: i === 0 ? '-3deg' : i === 1 ? '0deg' : '4deg' },
-                  { translateX: i === 0 ? -4 : i === 2 ? 4 : 0 },
-                ],
-              }}
-            />
-          ))}
+        <View style={wrap}>
+          <View style={eyesRow}>
+            <Eye color={c} size={eyeSize * 0.9}/>
+            <Eye color={c} size={eyeSize * 0.9}/>
+          </View>
+          <Frown color={c} width={mouthW} height={mouthH * 0.85} thickness={size * 0.04}/>
         </View>
       );
 
-    case 'STATIC': {
-      const cells = 25;
+    case 'WINK':
       return (
-        <View style={[gs.staticWrap, { width: size, height: size, opacity: fade }]}>
-          {Array.from({ length: cells }).map((_, i) => {
-            const on = (i * 7 + 3) % 5 < 2;
-            return (
-              <View
-                key={i}
-                style={{
-                  width: size / 5 - 2,
-                  height: size / 5 - 2,
-                  margin: 1,
-                  backgroundColor: on ? mood.primary : 'transparent',
-                  opacity: on ? 0.7 + ((i % 3) * 0.1) : 0,
-                }}
-              />
-            );
-          })}
-        </View>
-      );
-    }
-
-    case 'STORM':
-      return (
-        <View style={[gs.wrap, { width: size, height: size, opacity: fade }]}>
-          <View style={{
-            width: 3, height: size * 0.32, backgroundColor: mood.primary,
-            transform: [{ rotate: '15deg' }, { translateY: -size * 0.18 }, { translateX: -size * 0.05 }],
-          }} />
-          <View style={{
-            width: 3, height: size * 0.28, backgroundColor: mood.primary,
-            transform: [{ rotate: '-22deg' }, { translateY: 0 }, { translateX: size * 0.03 }],
-          }} />
-          <View style={{
-            width: 3, height: size * 0.32, backgroundColor: mood.primary,
-            transform: [{ rotate: '12deg' }, { translateY: size * 0.18 }, { translateX: size * 0.06 }],
-          }} />
-          <View style={[gs.absDot, {
-            width: size * 0.12, height: size * 0.12, borderRadius: size * 0.06,
-            backgroundColor: mood.primary, top: size * 0.04, left: size * 0.04,
-            opacity: 0.5,
-          }]} />
+        <View style={wrap}>
+          <View style={eyesRow}>
+            <Eye color={c} size={eyeSize}/>
+            <View style={{ width: eyeSize, height: eyeSize, alignItems: 'center', justifyContent: 'center' }}>
+              <ClosedEye color={c} width={eyeSize * 1.05}/>
+            </View>
+          </View>
+          <Smile color={c} width={mouthW * 0.95} height={mouthH * 0.85} thickness={size * 0.04}/>
         </View>
       );
 
-    case 'ORBIT': {
+    case 'SURPRISE':
       return (
-        <View style={[gs.wrap, { width: size, height: size, opacity: fade }]}>
-          {[0.95, 0.65, 0.35].map((s, i) => (
-            <View
-              key={i}
-              style={[
-                gs.absRing,
-                {
-                  width: size * s, height: size * s, borderRadius: (size * s) / 2,
-                  borderColor: mood.primary, borderWidth: 1, opacity: 0.35,
-                },
-              ]}
-            />
-          ))}
-          {[0, 120, 240].map((deg, i) => (
-            <View
-              key={deg}
-              style={[
-                gs.absDot,
-                {
-                  width: size * 0.12, height: size * 0.12, borderRadius: size * 0.06,
-                  backgroundColor: mood.primary,
-                  transform: [{ rotate: `${deg}deg` }, { translateY: -size * (0.45 - i * 0.15) }],
-                },
-              ]}
-            />
-          ))}
-          <View style={{
-            width: size * 0.16, height: size * 0.16, borderRadius: size * 0.08,
-            backgroundColor: mood.primary,
-          }} />
+        <View style={wrap}>
+          <View style={eyesRow}>
+            <RingEye color={c} size={eyeSize * 1.05}/>
+            <RingEye color={c} size={eyeSize * 1.05}/>
+          </View>
+          <OMouth color={c} size={mouthW * 0.42} thickness={size * 0.04}/>
         </View>
       );
-    }
 
-    case 'GRID': {
+    case 'SLEEPY':
       return (
-        <View style={[gs.gridWrap, { width: size, height: size, opacity: fade }]}>
-          {Array.from({ length: 9 }).map((_, i) => {
-            const big = i === 4;
-            const med = [1, 3, 5, 7].includes(i);
-            return (
-              <View key={i} style={[gs.gridCell, { width: size / 3, height: size / 3 }]}>
-                <View
-                  style={{
-                    width: big ? size / 4 : med ? size / 6 : size / 9,
-                    height: big ? size / 4 : med ? size / 6 : size / 9,
-                    backgroundColor: mood.primary,
-                    opacity: big ? 1 : med ? 0.7 : 0.4,
-                  }}
-                />
-              </View>
-            );
-          })}
+        <View style={wrap}>
+          <View style={eyesRow}>
+            <ClosedEye color={c} width={eyeSize * 1.1}/>
+            <ClosedEye color={c} width={eyeSize * 1.1}/>
+          </View>
+          <Smile color={c} width={mouthW * 0.5} height={mouthH * 0.4} thickness={size * 0.035}/>
         </View>
       );
-    }
 
-    case 'PRISM':
+    case 'ANGRY':
       return (
-        <View style={[gs.wrap, { width: size, height: size, opacity: fade }]}>
-          {[0, 60, 120].map((deg, i) => (
-            <View
-              key={deg}
-              style={{
-                position: 'absolute',
-                width: size * 0.55,
-                height: size * 0.55,
-                borderColor: i === 0 ? mood.primary : i === 1 ? mood.shade : '#FF8030',
-                borderWidth: 2,
-                transform: [{ rotate: `${deg}deg` }],
-                opacity: 0.85,
-              }}
-            />
-          ))}
-          <View style={{
-            width: size * 0.12, height: size * 0.12, borderRadius: size * 0.06,
-            backgroundColor: mood.primary,
-          }} />
+        <View style={wrap}>
+          <View style={eyesRow}>
+            <View style={{ alignItems: 'center' }}>
+              <View style={{
+                width: eyeSize * 1.4, height: size * 0.05,
+                backgroundColor: accent, borderRadius: 2,
+                transform: [{ rotate: '18deg' }],
+                marginBottom: size * 0.02,
+              }}/>
+              <Eye color={c} size={eyeSize * 0.9}/>
+            </View>
+            <View style={{ alignItems: 'center' }}>
+              <View style={{
+                width: eyeSize * 1.4, height: size * 0.05,
+                backgroundColor: accent, borderRadius: 2,
+                transform: [{ rotate: '-18deg' }],
+                marginBottom: size * 0.02,
+              }}/>
+              <Eye color={c} size={eyeSize * 0.9}/>
+            </View>
+          </View>
+          <Frown color={c} width={mouthW} height={mouthH * 0.85} thickness={size * 0.04}/>
+        </View>
+      );
+
+    case 'CHILL':
+      return (
+        <View style={wrap}>
+          <View style={eyesRow}>
+            <ClosedEye color={c} width={eyeSize}/>
+            <ClosedEye color={c} width={eyeSize}/>
+          </View>
+          <View style={{ transform: [{ rotate: '-6deg' }] }}>
+            <StraightMouth color={c} width={mouthW * 0.85} thickness={size * 0.04}/>
+          </View>
         </View>
       );
 
     default:
-      return <View style={{ width: size, height: size }} />;
+      return <View style={{ width: size, height: size }}/>;
   }
 }
 
@@ -1268,39 +1368,6 @@ function bytesToBase64(bytes) {
 // ---------------------------------------------------------------------------
 // STYLES
 // ---------------------------------------------------------------------------
-
-const gs = StyleSheet.create({
-  wrap: {
-    alignItems: 'center',
-    justifyContent: 'center',
-    position: 'relative',
-  },
-  wrapColumn: {
-    alignItems: 'center',
-    justifyContent: 'center',
-    flexDirection: 'column',
-  },
-  absRing: {
-    position: 'absolute',
-  },
-  absDot: {
-    position: 'absolute',
-  },
-  staticWrap: {
-    flexDirection: 'row',
-    flexWrap: 'wrap',
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-  gridWrap: {
-    flexDirection: 'row',
-    flexWrap: 'wrap',
-  },
-  gridCell: {
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-});
 
 const styles = StyleSheet.create({
   screen: { flex: 1 },

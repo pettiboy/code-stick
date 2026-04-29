@@ -11,18 +11,20 @@ The Stick hangs portrait-up as a **necklace**, broadcasting a mood as live abstr
 
 ## Moods
 
-| id | feel | art |
-| ------ | ------ | ------ |
-| `PULSE` | alive | concentric rings expanding outward |
-| `BLOOM` | in love | radiating petals beating |
-| `DRIFT` | calm | layered sine waves |
-| `STATIC` | anxious | TV noise + scanlines |
-| `STORM` | angry | lightning bolts flickering |
-| `ORBIT` | curious | dots circling a core |
-| `GRID` | focused | pulsing geometric grid |
-| `PRISM` | party | rotating triangles |
+Eight emoji-style faces. Static — no flicker, no animation, just clean expressions.
 
-While recording, the active mood reacts to your voice — louder peaks intensify the animation. Idle, it breathes on a slow sine.
+| id | feel | face |
+| ------ | ------ | ------ |
+| `HAPPY` | joyful | round eyes + big smile |
+| `LOVE` | smitten | heart eyes + smile |
+| `SAD` | blue | round eyes with tears + frown |
+| `WINK` | flirty | one open eye, one closed, smile |
+| `SURPRISE` | shocked | hollow ring eyes + O mouth |
+| `SLEEPY` | tired | closed eyes + tiny smile + zz |
+| `ANGRY` | mad | angled brows + frown |
+| `CHILL` | easy | half-closed eyes + smirk |
+
+A small red dot in the top-right corner blinks while recording. Otherwise the face is the entire screen.
 
 ## Controls
 
@@ -77,7 +79,7 @@ Control messages are UTF-8 lines ending in `\n`:
 | Phone → Stick | `MOOD:<id>\n` | set mood (from tile tap or transcript suggestion) |
 | Phone → Stick | `ERR:<message>\n` | upload error |
 
-Mood ids: `PULSE`, `BLOOM`, `DRIFT`, `STATIC`, `STORM`, `ORBIT`, `GRID`, `PRISM`.
+Mood ids: `HAPPY`, `LOVE`, `SAD`, `WINK`, `SURPRISE`, `SLEEPY`, `ANGRY`, `CHILL`.
 
 ## Flash The Stick
 

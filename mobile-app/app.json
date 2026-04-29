@@ -17,7 +17,8 @@
       "bundleIdentifier": "com.example.m5voicestick",
       "infoPlist": {
         "NSBluetoothAlwaysUsageDescription": "M5 Voice Stick uses Bluetooth to receive audio from your M5StickC Plus2.",
-        "NSMicrophoneUsageDescription": "Microphone access is reserved for future phone-mic fallback recording."
+        "NSMicrophoneUsageDescription": "Microphone access is reserved for future phone-mic fallback recording.",
+        "UIBackgroundModes": ["bluetooth-central"]
       }
     },
     "android": {
@@ -28,7 +29,8 @@
         "android.permission.BLUETOOTH_SCAN",
         "android.permission.BLUETOOTH_CONNECT",
         "android.permission.ACCESS_FINE_LOCATION",
-        "android.permission.INTERNET"
+        "android.permission.INTERNET",
+        "android.permission.POST_NOTIFICATIONS"
       ],
       "adaptiveIcon": {
         "foregroundImage": "./assets/adaptive-icon.png",
@@ -41,7 +43,8 @@
     },
     "plugins": [
       "expo-secure-store",
-      "expo-font"
+      "expo-font",
+      "expo-notifications"
     ]
   }
 }
